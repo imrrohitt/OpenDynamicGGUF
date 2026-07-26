@@ -182,8 +182,8 @@ The pipeline is split into 16 small steps, each with its own design doc. Start a
 | 11 | Cache reference logits | [doc](docs/steps/11-cache-reference-logits.md) | `odg reference-logits` | ✅ Implemented (proxy; llama-perplexity optional) |
 | 12 | Sensitivity probe | [doc](docs/steps/12-sensitivity-probe.md) | `odg sensitivity` | ✅ Implemented (proxy table; llama probes TBD) |
 | 13 | Optimize recipe | [doc](docs/steps/13-optimize-recipe.md) | `odg optimize` | ✅ Implemented (greedy + Pareto) |
-| 14 | Export GGUF | [doc](docs/steps/14-export-gguf.md) | — | 🚧 Planned |
-| 15 | Validate & release | [doc](docs/steps/15-validate-and-release.md) | — | 🚧 Planned |
+| 14 | Export GGUF | [doc](docs/steps/14-export-gguf.md) | `odg export` | ✅ Implemented (dry-run; llama-quantize optional) |
+| 15 | Validate & release | [doc](docs/steps/15-validate-and-release.md) | `odg validate` | ✅ Implemented (proxy gates + report) |
 
 The sections below are the condensed architecture. For teachable detail, worked examples, and per-step checklists, use the step files.
 

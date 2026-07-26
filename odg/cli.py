@@ -276,6 +276,52 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_opt.add_argument("--no-explain", action="store_true")
 
+    # --- export (step 14) ---
+    p_ex = sub.add_parser(
+        "export",
+        help="Step 14: export candidate GGUF from recipe (llama-quantize or dry-run)",
+    )
+    p_ex.add_argument("--model", "-m", default=None)
+    p_ex.add_argument("--run", default=None)
+    p_ex.add_argument("--force", action="store_true")
+    p_ex.add_argument(
+        "--mode",
+        choices=("auto", "llama", "dry-run"),
+        default="auto",
+    )
+    p_ex.add_argument(
+        "--llama-quantize",
+        type=Path,
+        default=None,
+        help="Path to llama-quantize (or set LLAMA_CPP_DIR)",
+    )
+    p_ex.add_argument(
+        "--base-type",
+        default="q4_k_m",
+        help="Fallback/base type for llama-quantize (default q4_k_m)",
+    )
+    p_ex.add_argument("--no-explain", action="store_true")
+
+    # --- validate (step 15) ---
+    p_val = sub.add_parser(
+        "validate",
+        help="Step 15: validate candidate on held-out gates; stage release",
+    )
+    p_val.add_argument("--model", "-m", default=None)
+    p_val.add_argument("--run", default=None)
+    p_val.add_argument("--force", action="store_true")
+    p_val.add_argument(
+        "--mode",
+        choices=("auto", "llama", "proxy"),
+        default="auto",
+    )
+    p_val.add_argument(
+        "--strict",
+        action="store_true",
+        help="Do not allow PROVISIONAL verdict without a real GGUF",
+    )
+    p_val.add_argument("--no-explain", action="store_true")
+
     # --- status / runs ---
     p_status = sub.add_parser("status", help="Show checkpoint status for a run")
     p_status.add_argument("--run", default=None, help="run_id (default: latest for --model)")
@@ -311,6 +357,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_sensitivity(args)
     if args.command == "optimize":
         return cmd_optimize(args)
+    if args.command == "export":
+        return cmd_export(args)
+    if args.command == "validate":
+        return cmd_validate(args)
     if args.command == "status":
         return cmd_status(args)
     if args.command == "runs":
@@ -1877,6 +1927,229 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export(args: argparse.Namespace) -> int:
+    from odg.export import export_gguf
+    from odg.store import StepAlreadyDone
+
+    print_explain = not args.no_explain
+    store = _store(args)
+
+    try:
+        meta = _require_run(store, model=args.model, run_id=args.run)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if not store.is_step_done(meta.run_id, "optimize"):
+        print(
+            "ERROR: Step 13 (optimize) is not done.\n"
+            f"  Run: odg optimize --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if print_explain:
+        _banner_export(meta.model_ref, meta.run_id, meta.root)
+
+    if store.is_step_done(meta.run_id, "export") and not args.force:
+        out = store.read_step_output(meta.run_id, "export")
+        if print_explain:
+            print("Step 14 already checkpointed as done — loading from store.")
+            print(f"  path: {store.step_path(meta.run_id, 'export')}")
+            print("  (pass --force to re-run)\n")
+            print(json.dumps(out, indent=2))
+            print("\n" + store.summary(meta.run_id))
+        elif out:
+            print(json.dumps(out, indent=2))
+        return 0
+
+    opt_dir = store.step_path(meta.run_id, "optimize")
+    recipe_path = opt_dir / "recipe.yaml"
+    recipe_tt = opt_dir / "recipe.tt"
+    if not recipe_path.is_file() or not recipe_tt.is_file():
+        print(f"ERROR: missing recipe.yaml / recipe.tt in {opt_dir}", file=sys.stderr)
+        return 1
+
+    freeze_out = store.read_step_output(meta.run_id, "freeze_gguf") or {}
+    gguf_in = freeze_out.get("gguf_path")
+    if not gguf_in or not Path(gguf_in).is_file():
+        step9 = store.step_path(meta.run_id, "freeze_gguf")
+        for name in ("model-bf16.gguf", "model-ref.gguf"):
+            if (step9 / name).is_file():
+                gguf_in = str(step9 / name)
+                break
+    if not gguf_in:
+        print("ERROR: frozen GGUF missing", file=sys.stderr)
+        return 1
+
+    imatrix_out = store.read_step_output(meta.run_id, "imatrix") or {}
+    imatrix_path = imatrix_out.get("imatrix_path")
+    if imatrix_path and not Path(imatrix_path).is_file():
+        imatrix_path = None
+
+    mode = args.mode
+    if mode == "auto":
+        mode = "dry-run"  # resolved inside export if binary appears
+
+    input_data = {
+        "from_step": "optimize",
+        "gguf_in": gguf_in,
+        "recipe_path": str(recipe_path),
+        "mode": args.mode,
+        "base_type": args.base_type,
+    }
+
+    try:
+        step_dir = store.begin_step(
+            meta.run_id, "export", input_data, force=args.force
+        )
+    except StepAlreadyDone:
+        return cmd_export(args)
+
+    try:
+        result = export_gguf(
+            model_ref=meta.model_ref,
+            out_dir=step_dir,
+            gguf_in=gguf_in,
+            recipe_path=recipe_path,
+            recipe_tt=recipe_tt,
+            imatrix_path=imatrix_path,
+            mode=args.mode,
+            llama_quantize=args.llama_quantize,
+            base_type=args.base_type,
+        )
+    except Exception as exc:  # noqa: BLE001
+        store.fail_step(meta.run_id, "export", str(exc))
+        print(f"\nERROR in Step 14 export: {exc}", file=sys.stderr)
+        return 1
+
+    payload = result.summary_dict()
+    log_text = "\n".join(result.steps_log) + "\n"
+    store.complete_step(meta.run_id, "export", payload, log_text=log_text)
+
+    if print_explain:
+        _explain_export(result)
+        print("\n=== checkpoint saved ===")
+        print(f"  run_id   : {meta.run_id}")
+        print(f"  step dir : {step_dir}")
+        print("\n" + store.summary(meta.run_id))
+        print("\n=== export summary (JSON) ===")
+        print(json.dumps(payload, indent=2))
+    else:
+        print(json.dumps(payload, indent=2))
+
+    return 0
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    from odg.store import StepAlreadyDone
+    from odg.validate import validate_and_release
+
+    print_explain = not args.no_explain
+    store = _store(args)
+
+    try:
+        meta = _require_run(store, model=args.model, run_id=args.run)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if not store.is_step_done(meta.run_id, "export"):
+        print(
+            "ERROR: Step 14 (export) is not done.\n"
+            f"  Run: odg export --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if print_explain:
+        _banner_validate(meta.model_ref, meta.run_id, meta.root)
+
+    if store.is_step_done(meta.run_id, "validate") and not args.force:
+        out = store.read_step_output(meta.run_id, "validate")
+        if print_explain:
+            print("Step 15 already checkpointed as done — loading from store.")
+            print(f"  path: {store.step_path(meta.run_id, 'validate')}")
+            print("  (pass --force to re-run)\n")
+            print(json.dumps(out, indent=2))
+            print("\n" + store.summary(meta.run_id))
+        elif out:
+            print(json.dumps(out, indent=2))
+        return 0
+
+    export_out = store.read_step_output(meta.run_id, "export") or {}
+    recipe_path = Path(export_out.get("recipe_path") or "")
+    if not recipe_path.is_file():
+        recipe_path = store.step_path(meta.run_id, "export") / "recipe.yaml"
+    if not recipe_path.is_file():
+        recipe_path = store.step_path(meta.run_id, "optimize") / "recipe.yaml"
+    if not recipe_path.is_file():
+        print("ERROR: recipe.yaml not found", file=sys.stderr)
+        return 1
+
+    resolve_out = store.read_step_output(meta.run_id, "resolve") or {}
+    desc = resolve_out.get("descriptor") or {}
+    sens_path = store.step_path(meta.run_id, "sensitivity") / "sensitivity.json"
+
+    input_data = {
+        "from_step": "export",
+        "mode": args.mode,
+        "strict": bool(args.strict),
+        "export_method": export_out.get("method"),
+        "gguf_out": export_out.get("gguf_out"),
+    }
+
+    try:
+        step_dir = store.begin_step(
+            meta.run_id, "validate", input_data, force=args.force
+        )
+    except StepAlreadyDone:
+        return cmd_validate(args)
+
+    try:
+        result = validate_and_release(
+            model_ref=meta.model_ref,
+            out_dir=step_dir,
+            recipe_path=recipe_path,
+            export_manifest=export_out,
+            specialty_domain=desc.get("specialty_domain"),
+            sensitivity_path=sens_path if sens_path.is_file() else None,
+            mode=args.mode,
+            allow_provisional=not args.strict,
+        )
+    except Exception as exc:  # noqa: BLE001
+        store.fail_step(meta.run_id, "validate", str(exc))
+        print(f"\nERROR in Step 15 validate: {exc}", file=sys.stderr)
+        return 1
+
+    payload = result.summary_dict()
+    log_text = "\n".join(result.steps_log) + "\n"
+    store.complete_step(meta.run_id, "validate", payload, log_text=log_text)
+
+    # Mark run complete when validate finishes
+    try:
+        meta2 = store.load_run(meta.run_id)
+        if result.verdict in {"RELEASE", "PROVISIONAL"}:
+            meta2.status = "done"
+            meta2.current_step = None
+            store._write_run_meta(meta2)  # noqa: SLF001
+    except Exception:  # noqa: BLE001
+        pass
+
+    if print_explain:
+        _explain_validate(result)
+        print("\n=== checkpoint saved ===")
+        print(f"  run_id   : {meta.run_id}")
+        print(f"  step dir : {step_dir}")
+        print("\n" + store.summary(meta.run_id))
+        print("\n=== validate summary (JSON) ===")
+        print(json.dumps(payload, indent=2))
+    else:
+        print(json.dumps(payload, indent=2))
+
+    return 0 if result.verdict != "FAIL" else 2
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     store = _store(args)
     if args.run:
@@ -2469,6 +2742,106 @@ def _explain_optimize(result) -> None:
 
     print("\n=== next ===")
     print("  Step 14 — export GGUF from recipe (llama-quantize + imatrix).")
+
+
+def _banner_export(model: str, run_id: str, root: str) -> None:
+    print(
+        """
+╔══════════════════════════════════════════════════════════════╗
+║  OpenDynamicGGUF — Step 14: Export GGUF                     ║
+╚══════════════════════════════════════════════════════════════╝
+""".rstrip()
+    )
+    print(
+        f"""
+What this step does
+-------------------
+  Input : recipe.yaml + recipe.tt + frozen GGUF (+ imatrix if present)
+  Model : {model}
+  Goal  : llama-quantize → candidate *-UD.gguf with provenance.
+          Dry-run writes the exact command when tools are missing.
+
+  Checkpoint
+  ----------
+  run_id : {run_id}
+  root   : {root}
+""".rstrip()
+    )
+
+
+def _explain_export(result) -> None:
+    print("\n=== what happened ===")
+    for line in result.steps_log:
+        print(f"  • {line}")
+
+    print("\n=== verdict ===")
+    print(f"  ✓ Method            : {result.method}")
+    print(f"  ✓ Output GGUF       : {result.gguf_out or '(dry-run / missing)'}")
+    if result.gguf_out_nbytes:
+        print(f"  ✓ Size              : {result.gguf_out_nbytes / (1024**2):.1f} MiB")
+    if result.estimated_bytes:
+        print(f"  ✓ Recipe estimate   : {result.estimated_bytes / (1024**2):.1f} MiB")
+    print(f"  ✓ Command           : {' '.join(result.command[:6])} …")
+
+    if result.notes:
+        print("\n=== notes ===")
+        for n in result.notes:
+            print(f"  • {n}")
+
+    print("\n=== next ===")
+    print("  Step 15 — validate on held-out; stage release or feedback.")
+
+
+def _banner_validate(model: str, run_id: str, root: str) -> None:
+    print(
+        """
+╔══════════════════════════════════════════════════════════════╗
+║  OpenDynamicGGUF — Step 15: Validate & release              ║
+╚══════════════════════════════════════════════════════════════╝
+""".rstrip()
+    )
+    print(
+        f"""
+What this step does
+-------------------
+  Input : candidate GGUF + recipe + held-out logits (when present)
+  Model : {model}
+  Goal  : Tiered gates → RELEASE / PROVISIONAL / FAIL + report.
+          Held-out only — never search/calib for final judgment.
+
+  Checkpoint
+  ----------
+  run_id : {run_id}
+  root   : {root}
+""".rstrip()
+    )
+
+
+def _explain_validate(result) -> None:
+    print("\n=== what happened ===")
+    for line in result.steps_log:
+        print(f"  • {line}")
+
+    print("\n=== verdict ===")
+    print(f"  ✓ Verdict           : {result.verdict}")
+    print(f"  ✓ Method            : {result.method}")
+    print(f"  ✓ Tier1 pass        : {result.tier1.get('pass')}")
+    print(f"  ✓ Tier2 pass        : {result.tier2.get('pass')}")
+    print(f"  ✓ Report            : {result.report_path}")
+    print(f"  ✓ Release dir       : {result.release_dir or '-'}")
+
+    if result.feedback:
+        print("\n=== feedback to optimizer ===")
+        for f in result.feedback:
+            print(f"  • {f.get('constraint')}: {f.get('action')}")
+
+    if result.notes:
+        print("\n=== notes ===")
+        for n in result.notes:
+            print(f"  • {n}")
+
+    print("\n=== pipeline ===")
+    print("  Steps 01–15 complete (plumbing). Install llama.cpp for real quant/KLD.")
 
 
 def _banner_classify(model: str, run_id: str, root: str) -> None:
