@@ -6,130 +6,52 @@
 
 ## Goal
 
-Map every tensor name to a **role** (and layer index / depth bucket) so the optimizer can treat attention-V differently from MLP-up, and skip norms.
+Map every tensor to a **role**, **depth** bucket, **group_id**, and **quantizable** flag.
 
 ---
 
-## Why it exists
+## Command
 
-Treating all tensors identically is weak. Empirically:
+```bash
+odg classify --model functiongemma:latest
+odg status --model functiongemma:latest
+```
 
-- `attn_v` is often **sensitive** (needs higher bits)
-- `ffn_up` / `ffn_gate` are often **cheap** to compress
-- LayerNorm / RMSNorm is usually **left in F16/F32**
-
-Classification encodes that structure **before** any probing.
-
----
-
-## Inputs / Outputs
-
-| | |
-|---|---|
-| **Input** | Flat tensor list from Step 03 |
-| **Output** | Same list + `role`, `layer`, `depth`, `quantizable` |
+Requires Step 03 done.
 
 ---
 
-## How it works
+## Outputs
 
-### Role taxonomy
+```text
+steps/04_classify/
+  output.json        # summary
+  classified.json    # every tensor + role/depth/group
+  classified.tsv
+  status.json
+  log.txt
+```
 
-| Role | Name patterns (examples) | Quantizable? |
+---
+
+## Example (FunctionGemma GGUF)
+
+| Role | Count | Quantizable? |
 |---|---|---|
-| `embedding` | `embed_tokens`, `tok_embeddings` | Yes (often pin high) |
-| `attn_q` | `q_proj`, `wq`, `attn_q` | Yes |
-| `attn_k` | `k_proj`, `wk`, `attn_k` | Yes |
-| `attn_v` | `v_proj`, `wv`, `attn_v` | Yes |
-| `attn_o` | `o_proj`, `wo`, `attn_output` | Yes |
-| `ffn_gate` | `gate_proj`, `w1`, `ffn_gate` | Yes |
-| `ffn_up` | `up_proj`, `w3`, `ffn_up` | Yes |
-| `ffn_down` | `down_proj`, `w2`, `ffn_down` | Yes |
-| `ffn_*_exps` | `experts.*` (MoE) | Yes |
-| `router` | MoE `gate` / `router` | Careful / pin |
-| `ssm_*` | Hybrid / Mamba | Role-dependent |
-| `norm` | `layernorm`, `rms_norm`, `norm` | **Usually skip** |
-| `lm_head` | `lm_head`, `output` | Yes (often pin high) |
-| `other` | unmatched | Review manually |
+| attn_q / k / v / o | 18 each | yes |
+| ffn_gate / up / down | 18 each | yes |
+| norm (attn_norm, ffn_norm, …) | many | **no** |
+| embedding (`token_embd`) | 1 | yes (pin later) |
 
-### Depth buckets
-
-Parse layer index from the name (`layers.12` → `12`):
-
-| Bucket | Example rule (18-layer model) |
-|---|---|
-| `early` | layers 0–5 |
-| `middle` | layers 6–12 |
-| `late` | layers 13–17 |
-
-Exact boundaries can be `floor(n/3)` thirds. Role × depth ≈ **~25 groups** later.
-
-### Classifier sketch
-
-```python
-import re
-
-RULES = [
-    (r"embed_tokens|tok_embeddings", "embedding"),
-    (r"lm_head|(^|\.)output(\.|$)", "lm_head"),
-    (r"(layernorm|rms_norm|(^|\.)norm)", "norm"),
-    (r"q_proj|\.wq\.|attn_q", "attn_q"),
-    (r"k_proj|\.wk\.|attn_k", "attn_k"),
-    (r"v_proj|\.wv\.|attn_v", "attn_v"),
-    (r"o_proj|\.wo\.|attn_output", "attn_o"),
-    (r"gate_proj|\.w1\.|ffn_gate", "ffn_gate"),
-    (r"up_proj|\.w3\.|ffn_up", "ffn_up"),
-    (r"down_proj|\.w2\.|ffn_down", "ffn_down"),
-]
-
-def classify(name: str, n_layers: int) -> dict:
-    role = "other"
-    for pat, r in RULES:
-        if re.search(pat, name, re.I):
-            role = r
-            break
-    m = re.search(r"layers?[.\[](\d+)", name)
-    layer = int(m.group(1)) if m else None
-    depth = depth_bucket(layer, n_layers) if layer is not None else None
-    return {
-        "role": role,
-        "layer": layer,
-        "depth": depth,
-        "quantizable": role not in ("norm",),
-    }
-```
-
----
-
-## Example
-
-```text
-Input name:  model.layers.12.self_attn.v_proj.weight
-
-Output:
-  role:        attn_v
-  layer:       12
-  depth:       middle
-  quantizable: true
-```
-
-```text
-Input name:  model.layers.3.input_layernorm.weight
-
-Output:
-  role:        norm
-  layer:       3
-  depth:       early
-  quantizable: false    ← skip in probes / recipe
-```
+`attn_k_norm` → **norm** (not attn_k) — rule order matters.
 
 ---
 
 ## Done when
 
-- [ ] ≥95% of weight tensors classified (rest flagged `other`)
-- [ ] Norms marked non-quantizable
-- [ ] Layer + depth present for block weights
+- [x] ≥95% coverage (non-`other`)
+- [x] Norms `quantizable=false`
+- [x] `group_id = role@depth` ready for probes
 
 ## Next
 

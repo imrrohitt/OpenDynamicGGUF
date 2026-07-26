@@ -77,6 +77,16 @@ def main(argv: list[str] | None = None) -> int:
     p_enum.add_argument("--force", action="store_true")
     p_enum.add_argument("--no-explain", action="store_true")
 
+    # --- classify (step 04) ---
+    p_cls = sub.add_parser(
+        "classify",
+        help="Step 04: assign role / depth / quantizable to every tensor",
+    )
+    p_cls.add_argument("--model", "-m", default=None)
+    p_cls.add_argument("--run", default=None)
+    p_cls.add_argument("--force", action="store_true")
+    p_cls.add_argument("--no-explain", action="store_true")
+
     # --- status / runs ---
     p_status = sub.add_parser("status", help="Show checkpoint status for a run")
     p_status.add_argument("--run", default=None, help="run_id (default: latest for --model)")
@@ -92,6 +102,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_load(args)
     if args.command == "enumerate":
         return cmd_enumerate(args)
+    if args.command == "classify":
+        return cmd_classify(args)
     if args.command == "status":
         return cmd_status(args)
     if args.command == "runs":
@@ -384,6 +396,118 @@ def cmd_enumerate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_classify(args: argparse.Namespace) -> int:
+    from odg.classify import classify_tensors
+    from odg.store import StepAlreadyDone
+
+    print_explain = not args.no_explain
+    store = _store(args)
+
+    try:
+        meta = _require_run(store, model=args.model, run_id=args.run)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if not store.is_step_done(meta.run_id, "enumerate"):
+        print(
+            "ERROR: Step 03 (enumerate) is not done.\n"
+            f"  Run: odg enumerate --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if print_explain:
+        _banner_classify(meta.model_ref, meta.run_id, meta.root)
+
+    if store.is_step_done(meta.run_id, "classify") and not args.force:
+        out = store.read_step_output(meta.run_id, "classify")
+        if print_explain:
+            print("Step 04 already checkpointed as done — loading from store.")
+            print(f"  path: {store.step_path(meta.run_id, 'classify')}")
+            print("  (pass --force to re-run)\n")
+            print(json.dumps(out, indent=2))
+            print("\n" + store.summary(meta.run_id))
+        elif out:
+            print(json.dumps(out, indent=2))
+        return 0
+
+    tensors_path = store.step_path(meta.run_id, "enumerate") / "tensors.json"
+    if not tensors_path.is_file():
+        print(f"ERROR: missing {tensors_path}", file=sys.stderr)
+        return 1
+    enum_full = json.loads(tensors_path.read_text())
+    tensors = enum_full.get("tensors") or []
+
+    load_out = store.read_step_output(meta.run_id, "load") or {}
+    n_layers = load_out.get("layer_count")
+
+    input_data = {
+        "from_step": "enumerate",
+        "tensors_path": str(tensors_path),
+        "n_tensors_in": len(tensors),
+        "n_layers": n_layers,
+    }
+
+    try:
+        step_dir = store.begin_step(
+            meta.run_id, "classify", input_data, force=args.force
+        )
+    except StepAlreadyDone:
+        return cmd_classify(args)
+
+    try:
+        result = classify_tensors(tensors, n_layers=n_layers)
+    except Exception as exc:  # noqa: BLE001
+        store.fail_step(meta.run_id, "classify", str(exc))
+        print(f"\nERROR in Step 04 classify: {exc}", file=sys.stderr)
+        return 1
+
+    payload = result.summary_dict()
+    full = result.to_dict()
+    log_text = "\n".join(result.steps_log) + "\n"
+
+    # TSV for browsing
+    tsv_lines = [
+        "index\tname\trole\tdepth\tlayer\tgroup_id\tquantizable\tdtype\tshape\tnbytes"
+    ]
+    for t in result.tensors:
+        shape = "x".join(str(d) for d in t.shape)
+        tsv_lines.append(
+            f"{t.index}\t{t.name}\t{t.role}\t{t.depth or ''}\t"
+            f"{'' if t.layer is None else t.layer}\t{t.group_id}\t"
+            f"{int(t.quantizable)}\t{t.dtype}\t{shape}\t{t.nbytes}"
+        )
+    tsv = "\n".join(tsv_lines) + "\n"
+
+    store.complete_step(
+        meta.run_id,
+        "classify",
+        payload,
+        log_text=log_text,
+        extra_artifacts={
+            "classified.json": json.dumps(full, indent=2).encode("utf-8") + b"\n",
+            "classified.tsv": tsv.encode("utf-8"),
+        },
+    )
+
+    if print_explain:
+        _explain_classify(result)
+        print("\n=== checkpoint saved ===")
+        print(f"  run_id   : {meta.run_id}")
+        print(f"  step dir : {step_dir}")
+        print(
+            "  files    : output.json, classified.json, classified.tsv, status.json, log.txt"
+        )
+        print("\n" + store.summary(meta.run_id))
+        print("\n=== classify summary (JSON) ===")
+        print(json.dumps(payload, indent=2))
+    else:
+        print(json.dumps(payload, indent=2))
+
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     store = _store(args)
     if args.run:
@@ -483,6 +607,66 @@ What this step does
   root   : {root}
 """.rstrip()
     )
+
+
+def _banner_classify(model: str, run_id: str, root: str) -> None:
+    print(
+        """
+╔══════════════════════════════════════════════════════════════╗
+║  OpenDynamicGGUF — Step 04: Classify tensors                ║
+╚══════════════════════════════════════════════════════════════╝
+""".rstrip()
+    )
+    print(
+        f"""
+What this step does
+-------------------
+  Input : Step 03 tensors.json
+  Model : {model}
+  Goal  : Assign role (attn_q, ffn_up, norm, …), depth bucket,
+          group_id, and quantizable flag to every tensor.
+
+  Checkpoint
+  ----------
+  run_id : {run_id}
+  root   : {root}
+""".rstrip()
+    )
+
+
+def _explain_classify(result) -> None:
+    print("\n=== what happened ===")
+    for line in result.steps_log:
+        print(f"  • {line}")
+
+    print("\n=== verdict ===")
+    print(f"  ✓ Tensors            : {result.n_tensors}")
+    print(f"  ✓ Layers             : {result.n_layers}")
+    print(f"  ✓ Coverage           : {result.coverage:.1%} (non-other)")
+    print(f"  ✓ Role summary       : {result.role_summary}")
+    print(f"  ✓ Quantizable        : {result.quantizable_summary}")
+    print(f"  ✓ Probe groups       : {len(result.group_summary)}")
+
+    print("\n=== groups (role@depth) ===")
+    for gid, n in list(result.group_summary.items())[:20]:
+        print(f"  {gid:28} {n:4} tensors")
+    if len(result.group_summary) > 20:
+        print(f"  … +{len(result.group_summary) - 20} more")
+
+    print("\n=== sample ===")
+    for t in result.tensors[:12]:
+        q = "Q" if t.quantizable else "—"
+        print(
+            f"  [{q}] {t.role:12} {t.depth or '-':7}  {t.name}"
+        )
+
+    if result.other_names:
+        print("\n  unmatched:")
+        for n in result.other_names[:10]:
+            print(f"    - {n}")
+
+    print("\n=== next ===")
+    print("  Step 05 — build tensor_catalog.json (HF/GGUF names + groups).")
 
 
 def _banner_enumerate(model: str, run_id: str, root: str) -> None:
