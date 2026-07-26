@@ -15,6 +15,7 @@ classifiers = [
 dependencies = [
   "huggingface_hub>=0.24.0",
   "numpy>=1.26",
+  "rich>=13.7",
 ]
 
 [project.urls]

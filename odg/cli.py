@@ -7,6 +7,8 @@ import json
 import sys
 from pathlib import Path
 
+from odg import ui
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
@@ -395,16 +397,15 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # Skip if already done
     if store.is_step_done(meta.run_id, "resolve") and not args.force:
         out = store.read_step_output(meta.run_id, "resolve")
-        if print_explain:
-            print("Step 01 already checkpointed as done — loading from store.")
-            print(f"  run   : {meta.run_id}")
-            print(f"  path  : {store.step_path(meta.run_id, 'resolve')}")
-            print("  (pass --force to re-run)")
-            print("\n=== stored output ===")
-            print(json.dumps(out, indent=2))
-            print("\n" + store.summary(meta.run_id))
-        elif out:
-            print(json.dumps(out, indent=2))
+        ui.already_done(
+            1,
+            "resolve",
+            run_id=meta.run_id,
+            path=store.step_path(meta.run_id, "resolve"),
+            output=out,
+            summary=store.summary(meta.run_id) if print_explain else None,
+            explain=print_explain,
+        )
         return 0
 
     input_data = {
@@ -422,16 +423,16 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         return cmd_resolve(args)
 
     try:
-        result = resolve_model(
-            args.model,
-            cache_dir=args.cache_dir,
-            download_weights=args.download_weights,
-            prefer_hf=args.prefer_hf,
-        )
+        with ui.working('Resolving model…', explain=print_explain):
+            result = resolve_model(
+                args.model,
+                cache_dir=args.cache_dir,
+                download_weights=args.download_weights,
+                prefer_hf=args.prefer_hf,
+            )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "resolve", str(exc))
-        print(f"\nERROR in Step 01 resolve: {exc}", file=sys.stderr)
-        print(f"Checkpointed failure → {store.step_path(meta.run_id, 'resolve')}")
+        ui.error(1, "resolve", exc, store.step_path(meta.run_id, "resolve"))
         return 1
 
     payload = result.to_dict()
@@ -445,24 +446,25 @@ def cmd_resolve(args: argparse.Namespace) -> int:
 
     if print_explain:
         _explain(result)
-        print(f"\n=== checkpoint saved ===")
-        print(f"  run_id   : {meta.run_id}")
-        print(f"  step dir : {step_dir}")
-        print(f"  files    : input.json, output.json, status.json, log.txt")
-        print("\n" + store.summary(meta.run_id))
+        ui.checkpoint_saved(
+            run_id=meta.run_id,
+            step_dir=step_dir,
+            files=tuple(x.strip() for x in 'input.json, output.json, status.json, log.txt'.split(',')),
+            explain=True,
+        )
+        ui.run_summary(store.summary(meta.run_id))
 
     text = json.dumps(payload, indent=2)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(text + "\n")
         if print_explain:
-            print(f"\nAlso wrote copy → {args.out}")
+            ui.info(f"Also wrote copy → {args.out}")
 
     if args.no_explain:
         print(text)
     else:
-        print("\n=== resolve result (JSON) ===")
-        print(text)
+        ui.json_panel(payload, title="resolve result")
 
     if not result.hf_repo_id and not result.local_path:
         return 2
@@ -501,14 +503,15 @@ def cmd_load(args: argparse.Namespace) -> int:
 
     if store.is_step_done(meta.run_id, "load") and not args.force:
         out = store.read_step_output(meta.run_id, "load")
-        if print_explain:
-            print("Step 02 already checkpointed as done — loading from store.")
-            print(f"  path: {store.step_path(meta.run_id, 'load')}")
-            print("  (pass --force to re-run)\n")
-            print(json.dumps(out, indent=2))
-            print("\n" + store.summary(meta.run_id))
-        elif out:
-            print(json.dumps(out, indent=2))
+        ui.already_done(
+            2,
+            "load",
+            run_id=meta.run_id,
+            path=store.step_path(meta.run_id, "load"),
+            output=out,
+            summary=store.summary(meta.run_id) if print_explain else None,
+            explain=print_explain,
+        )
         return 0
 
     input_data = {
@@ -523,13 +526,13 @@ def cmd_load(args: argparse.Namespace) -> int:
         return cmd_load(args)
 
     try:
-        loaded = load_model(resolve_out)
-        # Full tensor index for Step 03 (separate artifact — can be large)
-        tensors = tensor_index_from_resolve(resolve_out)
+        with ui.working('Loading model / parsing GGUF…', explain=print_explain):
+            loaded = load_model(resolve_out)
+            # Full tensor index for Step 03 (separate artifact — can be large)
+            tensors = tensor_index_from_resolve(resolve_out)
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "load", str(exc))
-        print(f"\nERROR in Step 02 load: {exc}", file=sys.stderr)
-        print(f"Checkpointed failure → {store.step_path(meta.run_id, 'load')}")
+        ui.error(2, "load", exc, store.step_path(meta.run_id, "load"))
         return 1
 
     payload = loaded.to_dict()
@@ -546,13 +549,14 @@ def cmd_load(args: argparse.Namespace) -> int:
 
     if print_explain:
         _explain_load(loaded)
-        print("\n=== checkpoint saved ===")
-        print(f"  run_id   : {meta.run_id}")
-        print(f"  step dir : {step_dir}")
-        print("  files    : input.json, output.json, status.json, log.txt, tensor_index.json")
-        print("\n" + store.summary(meta.run_id))
-        print("\n=== load result (JSON) ===")
-        print(json.dumps(payload, indent=2))
+        ui.checkpoint_saved(
+            run_id=meta.run_id,
+            step_dir=step_dir,
+            files=tuple(x.strip() for x in 'input.json, output.json, status.json, log.txt, tensor_index.json'.split(',')),
+            explain=True,
+        )
+        ui.run_summary(store.summary(meta.run_id))
+        ui.json_panel(payload, title="load result")
     else:
         print(json.dumps(payload, indent=2))
 
@@ -586,14 +590,15 @@ def cmd_enumerate(args: argparse.Namespace) -> int:
 
     if store.is_step_done(meta.run_id, "enumerate") and not args.force:
         out = store.read_step_output(meta.run_id, "enumerate")
-        if print_explain:
-            print("Step 03 already checkpointed as done — loading from store.")
-            print(f"  path: {store.step_path(meta.run_id, 'enumerate')}")
-            print("  (pass --force to re-run)\n")
-            print(json.dumps(out, indent=2))
-            print("\n" + store.summary(meta.run_id))
-        elif out:
-            print(json.dumps(out, indent=2))
+        ui.already_done(
+            3,
+            "enumerate",
+            run_id=meta.run_id,
+            path=store.step_path(meta.run_id, "enumerate"),
+            output=out,
+            summary=store.summary(meta.run_id) if print_explain else None,
+            explain=print_explain,
+        )
         return 0
 
     index_path = store.step_path(meta.run_id, "load") / "tensor_index.json"
@@ -616,10 +621,11 @@ def cmd_enumerate(args: argparse.Namespace) -> int:
         return cmd_enumerate(args)
 
     try:
-        result = enumerate_tensors(tensor_index)
+        with ui.working('Enumerating tensors…', explain=print_explain):
+            result = enumerate_tensors(tensor_index)
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "enumerate", str(exc))
-        print(f"\nERROR in Step 03 enumerate: {exc}", file=sys.stderr)
+        ui.error(3, "enumerate", exc, store.step_path(meta.run_id, "enumerate"))
         return 1
 
     payload = result.summary_dict()
@@ -640,13 +646,14 @@ def cmd_enumerate(args: argparse.Namespace) -> int:
 
     if print_explain:
         _explain_enumerate(result)
-        print("\n=== checkpoint saved ===")
-        print(f"  run_id   : {meta.run_id}")
-        print(f"  step dir : {step_dir}")
-        print("  files    : output.json, tensors.json, tensors.tsv, status.json, log.txt")
-        print("\n" + store.summary(meta.run_id))
-        print("\n=== enumerate summary (JSON) ===")
-        print(json.dumps(payload, indent=2))
+        ui.checkpoint_saved(
+            run_id=meta.run_id,
+            step_dir=step_dir,
+            files=tuple(x.strip() for x in 'output.json, tensors.json, tensors.tsv, status.json, log.txt'.split(',')),
+            explain=True,
+        )
+        ui.run_summary(store.summary(meta.run_id))
+        ui.json_panel(payload, title="enumerate summary")
     else:
         print(json.dumps(payload, indent=2))
 
@@ -679,14 +686,15 @@ def cmd_classify(args: argparse.Namespace) -> int:
 
     if store.is_step_done(meta.run_id, "classify") and not args.force:
         out = store.read_step_output(meta.run_id, "classify")
-        if print_explain:
-            print("Step 04 already checkpointed as done — loading from store.")
-            print(f"  path: {store.step_path(meta.run_id, 'classify')}")
-            print("  (pass --force to re-run)\n")
-            print(json.dumps(out, indent=2))
-            print("\n" + store.summary(meta.run_id))
-        elif out:
-            print(json.dumps(out, indent=2))
+        ui.already_done(
+            4,
+            "classify",
+            run_id=meta.run_id,
+            path=store.step_path(meta.run_id, "classify"),
+            output=out,
+            summary=store.summary(meta.run_id) if print_explain else None,
+            explain=print_explain,
+        )
         return 0
 
     tensors_path = store.step_path(meta.run_id, "enumerate") / "tensors.json"
@@ -714,10 +722,11 @@ def cmd_classify(args: argparse.Namespace) -> int:
         return cmd_classify(args)
 
     try:
-        result = classify_tensors(tensors, n_layers=n_layers)
+        with ui.working('Classifying tensors…', explain=print_explain):
+            result = classify_tensors(tensors, n_layers=n_layers)
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "classify", str(exc))
-        print(f"\nERROR in Step 04 classify: {exc}", file=sys.stderr)
+        ui.error(4, "classify", exc, store.step_path(meta.run_id, "classify"))
         return 1
 
     payload = result.summary_dict()
@@ -750,15 +759,14 @@ def cmd_classify(args: argparse.Namespace) -> int:
 
     if print_explain:
         _explain_classify(result)
-        print("\n=== checkpoint saved ===")
-        print(f"  run_id   : {meta.run_id}")
-        print(f"  step dir : {step_dir}")
-        print(
-            "  files    : output.json, classified.json, classified.tsv, status.json, log.txt"
+        ui.checkpoint_saved(
+            run_id=meta.run_id,
+            step_dir=step_dir,
+            files=('output.json', 'classified.json', 'classified.tsv', 'status.json', 'log.txt'),
+            explain=True,
         )
-        print("\n" + store.summary(meta.run_id))
-        print("\n=== classify summary (JSON) ===")
-        print(json.dumps(payload, indent=2))
+        ui.run_summary(store.summary(meta.run_id))
+        ui.json_panel(payload, title="classify summary")
     else:
         print(json.dumps(payload, indent=2))
 
@@ -793,14 +801,15 @@ def cmd_catalog(args: argparse.Namespace) -> int:
 
     if store.is_step_done(meta.run_id, "catalog") and not args.force:
         out = store.read_step_output(meta.run_id, "catalog")
-        if print_explain:
-            print("Step 05 already checkpointed as done — loading from store.")
-            print(f"  path: {store.step_path(meta.run_id, 'catalog')}")
-            print("  (pass --force to re-run)\n")
-            print(json.dumps(out, indent=2))
-            print("\n" + store.summary(meta.run_id))
-        elif out:
-            print(json.dumps(out, indent=2))
+        ui.already_done(
+            5,
+            "catalog",
+            run_id=meta.run_id,
+            path=store.step_path(meta.run_id, "catalog"),
+            output=out,
+            summary=store.summary(meta.run_id) if print_explain else None,
+            explain=print_explain,
+        )
         return 0
 
     classified_path = store.step_path(meta.run_id, "classify") / "classified.json"
@@ -840,22 +849,23 @@ def cmd_catalog(args: argparse.Namespace) -> int:
         return cmd_catalog(args)
 
     try:
-        catalog = build_catalog(
-            tensors,
-            model_ref=meta.model_ref,
-            hf_repo_id=resolve_out.get("hf_repo_id"),
-            source_path=source_path,
-            source_backend=load_out.get("backend"),
-            source_is_quantized=bool(
-                load_out.get("source_is_quantized")
-                or resolve_out.get("source_is_quantized")
-            ),
-            source_sha256=source_sha,
-            n_layers=load_out.get("layer_count") or classified.get("n_layers"),
-        )
+        with ui.working('Building tensor catalog…', explain=print_explain):
+            catalog = build_catalog(
+                tensors,
+                model_ref=meta.model_ref,
+                hf_repo_id=resolve_out.get("hf_repo_id"),
+                source_path=source_path,
+                source_backend=load_out.get("backend"),
+                source_is_quantized=bool(
+                    load_out.get("source_is_quantized")
+                    or resolve_out.get("source_is_quantized")
+                ),
+                source_sha256=source_sha,
+                n_layers=load_out.get("layer_count") or classified.get("n_layers"),
+            )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "catalog", str(exc))
-        print(f"\nERROR in Step 05 catalog: {exc}", file=sys.stderr)
+        ui.error(5, "catalog", exc, store.step_path(meta.run_id, "catalog"))
         return 1
 
     payload = catalog.summary_dict()
@@ -874,13 +884,14 @@ def cmd_catalog(args: argparse.Namespace) -> int:
 
     if print_explain:
         _explain_catalog(catalog)
-        print("\n=== checkpoint saved ===")
-        print(f"  run_id   : {meta.run_id}")
-        print(f"  step dir : {step_dir}")
-        print("  files    : output.json, tensor_catalog.json, status.json, log.txt")
-        print("\n" + store.summary(meta.run_id))
-        print("\n=== catalog summary (JSON) ===")
-        print(json.dumps(payload, indent=2))
+        ui.checkpoint_saved(
+            run_id=meta.run_id,
+            step_dir=step_dir,
+            files=tuple(x.strip() for x in 'output.json, tensor_catalog.json, status.json, log.txt'.split(',')),
+            explain=True,
+        )
+        ui.run_summary(store.summary(meta.run_id))
+        ui.json_panel(payload, title="catalog summary")
     else:
         print(json.dumps(payload, indent=2))
 
@@ -913,14 +924,15 @@ def cmd_weight_features(args: argparse.Namespace) -> int:
 
     if store.is_step_done(meta.run_id, "weight_features") and not args.force:
         out = store.read_step_output(meta.run_id, "weight_features")
-        if print_explain:
-            print("Step 06 already checkpointed as done — loading from store.")
-            print(f"  path: {store.step_path(meta.run_id, 'weight_features')}")
-            print("  (pass --force to re-run)\n")
-            print(json.dumps(out, indent=2))
-            print("\n" + store.summary(meta.run_id))
-        elif out:
-            print(json.dumps(out, indent=2))
+        ui.already_done(
+            6,
+            "weight_features",
+            run_id=meta.run_id,
+            path=store.step_path(meta.run_id, "weight_features"),
+            output=out,
+            summary=store.summary(meta.run_id) if print_explain else None,
+            explain=print_explain,
+        )
         return 0
 
     catalog_path = store.step_path(meta.run_id, "catalog") / "tensor_catalog.json"
@@ -949,14 +961,15 @@ def cmd_weight_features(args: argparse.Namespace) -> int:
         return cmd_weight_features(args)
 
     try:
-        updated, result = compute_catalog_weight_features(
-            catalog,
-            source_path=source_path,
-            only_quantizable=bool(args.only_quantizable),
-        )
+        with ui.working("Computing weight features…", explain=print_explain):
+            updated, result = compute_catalog_weight_features(
+                catalog,
+                source_path=source_path,
+                only_quantizable=bool(args.only_quantizable),
+            )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "weight_features", str(exc))
-        print(f"\nERROR in Step 06 weight-features: {exc}", file=sys.stderr)
+        ui.error(6, "weight_features", exc, store.step_path(meta.run_id, "weight_features"))
         return 1
 
     payload = result.summary_dict()
@@ -994,16 +1007,14 @@ def cmd_weight_features(args: argparse.Namespace) -> int:
 
     if print_explain:
         _explain_weight_features(result)
-        print("\n=== checkpoint saved ===")
-        print(f"  run_id   : {meta.run_id}")
-        print(f"  step dir : {step_dir}")
-        print(
-            "  files    : output.json, tensor_catalog.json, "
-            "group_features.json, status.json, log.txt"
+        ui.checkpoint_saved(
+            run_id=meta.run_id,
+            step_dir=step_dir,
+            files=('output.json', 'tensor_catalog.json', 'group_features.json', 'status.json', 'log.txt'),
+            explain=True,
         )
-        print("\n" + store.summary(meta.run_id))
-        print("\n=== weight-features summary (JSON) ===")
-        print(json.dumps(payload_out, indent=2))
+        ui.run_summary(store.summary(meta.run_id))
+        ui.json_panel(payload_out, title="weight-features summary")
     else:
         print(json.dumps(payload_out, indent=2))
 
@@ -1037,14 +1048,15 @@ def cmd_corpus(args: argparse.Namespace) -> int:
 
     if store.is_step_done(meta.run_id, "corpus") and not args.force:
         out = store.read_step_output(meta.run_id, "corpus")
-        if print_explain:
-            print("Step 07 already checkpointed as done — loading from store.")
-            print(f"  path: {store.step_path(meta.run_id, 'corpus')}")
-            print("  (pass --force to re-run)\n")
-            print(json.dumps(out, indent=2))
-            print("\n" + store.summary(meta.run_id))
-        elif out:
-            print(json.dumps(out, indent=2))
+        ui.already_done(
+            7,
+            "corpus",
+            run_id=meta.run_id,
+            path=store.step_path(meta.run_id, "corpus"),
+            output=out,
+            summary=store.summary(meta.run_id) if print_explain else None,
+            explain=print_explain,
+        )
         return 0
 
     resolve_out = store.read_step_output(meta.run_id, "resolve") or {}
@@ -1069,17 +1081,18 @@ def cmd_corpus(args: argparse.Namespace) -> int:
         return cmd_corpus(args)
 
     try:
-        result, manifest = build_corpus(
-            model_ref=meta.model_ref,
-            out_dir=step_dir,
-            chat_template=chat_template,
-            specialty_domain=specialty,
-            target_tokens=int(args.target_tokens),
-            seed=int(args.seed),
-        )
+        with ui.working('Building calibration corpus…', explain=print_explain):
+            result, manifest = build_corpus(
+                model_ref=meta.model_ref,
+                out_dir=step_dir,
+                chat_template=chat_template,
+                specialty_domain=specialty,
+                target_tokens=int(args.target_tokens),
+                seed=int(args.seed),
+            )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "corpus", str(exc))
-        print(f"\nERROR in Step 07 corpus: {exc}", file=sys.stderr)
+        ui.error(7, "corpus", exc, store.step_path(meta.run_id, "corpus"))
         return 1
 
     payload = result.summary_dict()
@@ -1099,16 +1112,14 @@ def cmd_corpus(args: argparse.Namespace) -> int:
 
     if print_explain:
         _explain_corpus(result)
-        print("\n=== checkpoint saved ===")
-        print(f"  run_id   : {meta.run_id}")
-        print(f"  step dir : {step_dir}")
-        print(
-            "  files    : output.json, calib.txt, search.txt, heldout.txt, "
-            "corpus_manifest.json, status.json, log.txt"
+        ui.checkpoint_saved(
+            run_id=meta.run_id,
+            step_dir=step_dir,
+            files=('output.json', 'calib.txt', 'search.txt', 'heldout.txt', 'corpus_manifest.json', 'status.json', 'log.txt'),
+            explain=True,
         )
-        print("\n" + store.summary(meta.run_id))
-        print("\n=== corpus summary (JSON) ===")
-        print(json.dumps(payload, indent=2))
+        ui.run_summary(store.summary(meta.run_id))
+        ui.json_panel(payload, title="corpus summary")
     else:
         print(json.dumps(payload, indent=2))
 
@@ -1148,14 +1159,15 @@ def cmd_activation_features(args: argparse.Namespace) -> int:
 
     if store.is_step_done(meta.run_id, "activation_features") and not args.force:
         out = store.read_step_output(meta.run_id, "activation_features")
-        if print_explain:
-            print("Step 08 already checkpointed as done — loading from store.")
-            print(f"  path: {store.step_path(meta.run_id, 'activation_features')}")
-            print("  (pass --force to re-run)\n")
-            print(json.dumps(out, indent=2))
-            print("\n" + store.summary(meta.run_id))
-        elif out:
-            print(json.dumps(out, indent=2))
+        ui.already_done(
+            8,
+            "activation_features",
+            run_id=meta.run_id,
+            path=store.step_path(meta.run_id, "activation_features"),
+            output=out,
+            summary=store.summary(meta.run_id) if print_explain else None,
+            explain=print_explain,
+        )
         return 0
 
     catalog_path = (
@@ -1204,18 +1216,19 @@ def cmd_activation_features(args: argparse.Namespace) -> int:
         return cmd_activation_features(args)
 
     try:
-        updated, result = compute_catalog_activation_features(
-            catalog,
-            calib_path=calib_path,
-            mode=args.mode,
-            hf_model_id=hf_id,
-            hf_local_path=hf_local,
-            max_forward_docs=int(args.max_docs),
-            corpus_domain_counts=corpus_out.get("domain_counts"),
-        )
+        with ui.working('Computing activation features…', explain=print_explain):
+            updated, result = compute_catalog_activation_features(
+                catalog,
+                calib_path=calib_path,
+                mode=args.mode,
+                hf_model_id=hf_id,
+                hf_local_path=hf_local,
+                max_forward_docs=int(args.max_docs),
+                corpus_domain_counts=corpus_out.get("domain_counts"),
+            )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "activation_features", str(exc))
-        print(f"\nERROR in Step 08 activation-features: {exc}", file=sys.stderr)
+        ui.error(8, "activation_features", exc, store.step_path(meta.run_id, "activation_features"))
         return 1
 
     payload = {
@@ -1259,16 +1272,14 @@ def cmd_activation_features(args: argparse.Namespace) -> int:
 
     if print_explain:
         _explain_activation_features(result)
-        print("\n=== checkpoint saved ===")
-        print(f"  run_id   : {meta.run_id}")
-        print(f"  step dir : {step_dir}")
-        print(
-            "  files    : output.json, tensor_catalog.json, "
-            "activation_features.json, status.json, log.txt"
+        ui.checkpoint_saved(
+            run_id=meta.run_id,
+            step_dir=step_dir,
+            files=('output.json', 'tensor_catalog.json', 'activation_features.json', 'status.json', 'log.txt'),
+            explain=True,
         )
-        print("\n" + store.summary(meta.run_id))
-        print("\n=== activation-features summary (JSON) ===")
-        print(json.dumps(payload, indent=2))
+        ui.run_summary(store.summary(meta.run_id))
+        ui.json_panel(payload, title="activation-features summary")
     else:
         print(json.dumps(payload, indent=2))
 
@@ -1301,14 +1312,15 @@ def cmd_freeze_gguf(args: argparse.Namespace) -> int:
 
     if store.is_step_done(meta.run_id, "freeze_gguf") and not args.force:
         out = store.read_step_output(meta.run_id, "freeze_gguf")
-        if print_explain:
-            print("Step 09 already checkpointed as done — loading from store.")
-            print(f"  path: {store.step_path(meta.run_id, 'freeze_gguf')}")
-            print("  (pass --force to re-run)\n")
-            print(json.dumps(out, indent=2))
-            print("\n" + store.summary(meta.run_id))
-        elif out:
-            print(json.dumps(out, indent=2))
+        ui.already_done(
+            9,
+            "freeze_gguf",
+            run_id=meta.run_id,
+            path=store.step_path(meta.run_id, "freeze_gguf"),
+            output=out,
+            summary=store.summary(meta.run_id) if print_explain else None,
+            explain=print_explain,
+        )
         return 0
 
     resolve_out = store.read_step_output(meta.run_id, "resolve") or {}
@@ -1351,20 +1363,21 @@ def cmd_freeze_gguf(args: argparse.Namespace) -> int:
         return cmd_freeze_gguf(args)
 
     try:
-        result = freeze_gguf(
-            model_ref=meta.model_ref,
-            out_dir=step_dir,
-            source_path=source_path,
-            source_is_quantized=source_is_quantized,
-            hf_local_path=hf_local,
-            catalog_tensor_names=catalog_names,
-            mode=args.mode,
-            convert_script=args.convert_script,
-            require_bf16=bool(args.require_bf16),
-        )
+        with ui.working('Freezing BF16/reference GGUF…', explain=print_explain):
+            result = freeze_gguf(
+                model_ref=meta.model_ref,
+                out_dir=step_dir,
+                source_path=source_path,
+                source_is_quantized=source_is_quantized,
+                hf_local_path=hf_local,
+                catalog_tensor_names=catalog_names,
+                mode=args.mode,
+                convert_script=args.convert_script,
+                require_bf16=bool(args.require_bf16),
+            )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "freeze_gguf", str(exc))
-        print(f"\nERROR in Step 09 freeze-gguf: {exc}", file=sys.stderr)
+        ui.error(9, "freeze_gguf", exc, store.step_path(meta.run_id, "freeze_gguf"))
         return 1
 
     payload = result.summary_dict()
@@ -1388,16 +1401,14 @@ def cmd_freeze_gguf(args: argparse.Namespace) -> int:
 
     if print_explain:
         _explain_freeze_gguf(result)
-        print("\n=== checkpoint saved ===")
-        print(f"  run_id   : {meta.run_id}")
-        print(f"  step dir : {step_dir}")
-        print(
-            "  files    : output.json, model-*.gguf, *.sha256, "
-            "freeze_manifest.json, status.json, log.txt"
+        ui.checkpoint_saved(
+            run_id=meta.run_id,
+            step_dir=step_dir,
+            files=('output.json', 'model-*.gguf', '*.sha256', 'freeze_manifest.json', 'status.json', 'log.txt'),
+            explain=True,
         )
-        print("\n" + store.summary(meta.run_id))
-        print("\n=== freeze-gguf summary (JSON) ===")
-        print(json.dumps(payload, indent=2))
+        ui.run_summary(store.summary(meta.run_id))
+        ui.json_panel(payload, title="freeze-gguf summary")
     else:
         print(json.dumps(payload, indent=2))
 
@@ -1437,14 +1448,15 @@ def cmd_imatrix(args: argparse.Namespace) -> int:
 
     if store.is_step_done(meta.run_id, "imatrix") and not args.force:
         out = store.read_step_output(meta.run_id, "imatrix")
-        if print_explain:
-            print("Step 10 already checkpointed as done — loading from store.")
-            print(f"  path: {store.step_path(meta.run_id, 'imatrix')}")
-            print("  (pass --force to re-run)\n")
-            print(json.dumps(out, indent=2))
-            print("\n" + store.summary(meta.run_id))
-        elif out:
-            print(json.dumps(out, indent=2))
+        ui.already_done(
+            10,
+            "imatrix",
+            run_id=meta.run_id,
+            path=store.step_path(meta.run_id, "imatrix"),
+            output=out,
+            summary=store.summary(meta.run_id) if print_explain else None,
+            explain=print_explain,
+        )
         return 0
 
     freeze_out = store.read_step_output(meta.run_id, "freeze_gguf") or {}
@@ -1496,20 +1508,21 @@ def cmd_imatrix(args: argparse.Namespace) -> int:
         return cmd_imatrix(args)
 
     try:
-        result = build_imatrix(
-            model_ref=meta.model_ref,
-            out_dir=step_dir,
-            gguf_path=gguf_path,
-            calib_path=calib_path,
-            catalog=catalog,
-            gguf_sha256=freeze_out.get("gguf_sha256"),
-            mode=args.mode,
-            llama_imatrix=args.llama_imatrix,
-            n_chunks=chunks_arg,
-        )
+        with ui.working('Building importance matrix…', explain=print_explain):
+            result = build_imatrix(
+                model_ref=meta.model_ref,
+                out_dir=step_dir,
+                gguf_path=gguf_path,
+                calib_path=calib_path,
+                catalog=catalog,
+                gguf_sha256=freeze_out.get("gguf_sha256"),
+                mode=args.mode,
+                llama_imatrix=args.llama_imatrix,
+                n_chunks=chunks_arg,
+            )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "imatrix", str(exc))
-        print(f"\nERROR in Step 10 imatrix: {exc}", file=sys.stderr)
+        ui.error(10, "imatrix", exc, store.step_path(meta.run_id, "imatrix"))
         return 1
 
     payload = result.summary_dict()
@@ -1528,16 +1541,14 @@ def cmd_imatrix(args: argparse.Namespace) -> int:
 
     if print_explain:
         _explain_imatrix(result)
-        print("\n=== checkpoint saved ===")
-        print(f"  run_id   : {meta.run_id}")
-        print(f"  step dir : {step_dir}")
-        print(
-            "  files    : output.json, imatrix.gguf|proxy, "
-            "imatrix_manifest.json, status.json, log.txt"
+        ui.checkpoint_saved(
+            run_id=meta.run_id,
+            step_dir=step_dir,
+            files=('output.json', 'imatrix.gguf|proxy', 'imatrix_manifest.json', 'status.json', 'log.txt'),
+            explain=True,
         )
-        print("\n" + store.summary(meta.run_id))
-        print("\n=== imatrix summary (JSON) ===")
-        print(json.dumps(payload, indent=2))
+        ui.run_summary(store.summary(meta.run_id))
+        ui.json_panel(payload, title="imatrix summary")
     else:
         print(json.dumps(payload, indent=2))
 
@@ -1584,14 +1595,15 @@ def cmd_reference_logits(args: argparse.Namespace) -> int:
 
     if store.is_step_done(meta.run_id, "reference_logits") and not args.force:
         out = store.read_step_output(meta.run_id, "reference_logits")
-        if print_explain:
-            print("Step 11 already checkpointed as done — loading from store.")
-            print(f"  path: {store.step_path(meta.run_id, 'reference_logits')}")
-            print("  (pass --force to re-run)\n")
-            print(json.dumps(out, indent=2))
-            print("\n" + store.summary(meta.run_id))
-        elif out:
-            print(json.dumps(out, indent=2))
+        ui.already_done(
+            11,
+            "reference_logits",
+            run_id=meta.run_id,
+            path=store.step_path(meta.run_id, "reference_logits"),
+            output=out,
+            summary=store.summary(meta.run_id) if print_explain else None,
+            explain=print_explain,
+        )
         return 0
 
     freeze_out = store.read_step_output(meta.run_id, "freeze_gguf") or {}
@@ -1634,19 +1646,20 @@ def cmd_reference_logits(args: argparse.Namespace) -> int:
         return cmd_reference_logits(args)
 
     try:
-        result = cache_reference_logits(
-            model_ref=meta.model_ref,
-            out_dir=step_dir,
-            gguf_path=gguf_path,
-            search_path=search_path,
-            heldout_path=heldout_path,
-            gguf_sha256=freeze_out.get("gguf_sha256"),
-            mode=args.mode,
-            llama_perplexity=args.llama_perplexity,
-        )
+        with ui.working('Caching reference logits…', explain=print_explain):
+            result = cache_reference_logits(
+                model_ref=meta.model_ref,
+                out_dir=step_dir,
+                gguf_path=gguf_path,
+                search_path=search_path,
+                heldout_path=heldout_path,
+                gguf_sha256=freeze_out.get("gguf_sha256"),
+                mode=args.mode,
+                llama_perplexity=args.llama_perplexity,
+            )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "reference_logits", str(exc))
-        print(f"\nERROR in Step 11 reference-logits: {exc}", file=sys.stderr)
+        ui.error(11, "reference_logits", exc, store.step_path(meta.run_id, "reference_logits"))
         return 1
 
     payload = result.summary_dict()
@@ -1661,16 +1674,14 @@ def cmd_reference_logits(args: argparse.Namespace) -> int:
 
     if print_explain:
         _explain_reference_logits(result)
-        print("\n=== checkpoint saved ===")
-        print(f"  run_id   : {meta.run_id}")
-        print(f"  step dir : {step_dir}")
-        print(
-            "  files    : output.json, logits_manifest.json, "
-            "logits-*.bin|MISSING, status.json, log.txt"
+        ui.checkpoint_saved(
+            run_id=meta.run_id,
+            step_dir=step_dir,
+            files=('output.json', 'logits_manifest.json', 'logits-*.bin|MISSING', 'status.json', 'log.txt'),
+            explain=True,
         )
-        print("\n" + store.summary(meta.run_id))
-        print("\n=== reference-logits summary (JSON) ===")
-        print(json.dumps(payload, indent=2))
+        ui.run_summary(store.summary(meta.run_id))
+        ui.json_panel(payload, title="reference-logits summary")
     else:
         print(json.dumps(payload, indent=2))
 
@@ -1703,14 +1714,15 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
 
     if store.is_step_done(meta.run_id, "sensitivity") and not args.force:
         out = store.read_step_output(meta.run_id, "sensitivity")
-        if print_explain:
-            print("Step 12 already checkpointed as done — loading from store.")
-            print(f"  path: {store.step_path(meta.run_id, 'sensitivity')}")
-            print("  (pass --force to re-run)\n")
-            print(json.dumps(out, indent=2))
-            print("\n" + store.summary(meta.run_id))
-        elif out:
-            print(json.dumps(out, indent=2))
+        ui.already_done(
+            12,
+            "sensitivity",
+            run_id=meta.run_id,
+            path=store.step_path(meta.run_id, "sensitivity"),
+            output=out,
+            summary=store.summary(meta.run_id) if print_explain else None,
+            explain=print_explain,
+        )
         return 0
 
     catalog = None
@@ -1749,19 +1761,20 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
         return cmd_sensitivity(args)
 
     try:
-        result, _rows = build_sensitivity_table(
-            model_ref=meta.model_ref,
-            out_dir=step_dir,
-            catalog=catalog,
-            gguf_sha256=freeze_out.get("gguf_sha256"),
-            search_path=search_path if search_path.is_file() else None,
-            imatrix_proxy_path=imatrix_proxy if imatrix_proxy.is_file() else None,
-            mode=mode,
-            baseline_type=args.baseline,
-        )
+        with ui.working('Probing sensitivity (ΔKLD)…', explain=print_explain):
+            result, _rows = build_sensitivity_table(
+                model_ref=meta.model_ref,
+                out_dir=step_dir,
+                catalog=catalog,
+                gguf_sha256=freeze_out.get("gguf_sha256"),
+                search_path=search_path if search_path.is_file() else None,
+                imatrix_proxy_path=imatrix_proxy if imatrix_proxy.is_file() else None,
+                mode=mode,
+                baseline_type=args.baseline,
+            )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "sensitivity", str(exc))
-        print(f"\nERROR in Step 12 sensitivity: {exc}", file=sys.stderr)
+        ui.error(12, "sensitivity", exc, store.step_path(meta.run_id, "sensitivity"))
         return 1
 
     payload = result.summary_dict()
@@ -1776,13 +1789,14 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
 
     if print_explain:
         _explain_sensitivity(result)
-        print("\n=== checkpoint saved ===")
-        print(f"  run_id   : {meta.run_id}")
-        print(f"  step dir : {step_dir}")
-        print("  files    : output.json, sensitivity.json, status.json, log.txt")
-        print("\n" + store.summary(meta.run_id))
-        print("\n=== sensitivity summary (JSON) ===")
-        print(json.dumps(payload, indent=2))
+        ui.checkpoint_saved(
+            run_id=meta.run_id,
+            step_dir=step_dir,
+            files=tuple(x.strip() for x in 'output.json, sensitivity.json, status.json, log.txt'.split(',')),
+            explain=True,
+        )
+        ui.run_summary(store.summary(meta.run_id))
+        ui.json_panel(payload, title="sensitivity summary")
     else:
         print(json.dumps(payload, indent=2))
 
@@ -1815,14 +1829,15 @@ def cmd_optimize(args: argparse.Namespace) -> int:
 
     if store.is_step_done(meta.run_id, "optimize") and not args.force:
         out = store.read_step_output(meta.run_id, "optimize")
-        if print_explain:
-            print("Step 13 already checkpointed as done — loading from store.")
-            print(f"  path: {store.step_path(meta.run_id, 'optimize')}")
-            print("  (pass --force to re-run)\n")
-            print(json.dumps(out, indent=2))
-            print("\n" + store.summary(meta.run_id))
-        elif out:
-            print(json.dumps(out, indent=2))
+        ui.already_done(
+            13,
+            "optimize",
+            run_id=meta.run_id,
+            path=store.step_path(meta.run_id, "optimize"),
+            output=out,
+            summary=store.summary(meta.run_id) if print_explain else None,
+            explain=print_explain,
+        )
         return 0
 
     sens_path = store.step_path(meta.run_id, "sensitivity") / "sensitivity.json"
@@ -1866,22 +1881,23 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         return cmd_optimize(args)
 
     try:
-        result = optimize_recipes(
-            model_ref=meta.model_ref,
-            out_dir=step_dir,
-            catalog=catalog,
-            sensitivity=sensitivity,
-            budget_bytes=budget_bytes,
-            budget_ratio=float(args.budget_ratio),
-            hf_repo_id=resolve_out.get("hf_repo_id"),
-            gguf_sha256=freeze_out.get("gguf_sha256"),
-            imatrix_sha256=imatrix_out.get("imatrix_sha256"),
-            corpus_id=corpus_out.get("corpus_id"),
-            use_pins=not args.no_pins,
-        )
+        with ui.working('Optimizing quant recipe…', explain=print_explain):
+            result = optimize_recipes(
+                model_ref=meta.model_ref,
+                out_dir=step_dir,
+                catalog=catalog,
+                sensitivity=sensitivity,
+                budget_bytes=budget_bytes,
+                budget_ratio=float(args.budget_ratio),
+                hf_repo_id=resolve_out.get("hf_repo_id"),
+                gguf_sha256=freeze_out.get("gguf_sha256"),
+                imatrix_sha256=imatrix_out.get("imatrix_sha256"),
+                corpus_id=corpus_out.get("corpus_id"),
+                use_pins=not args.no_pins,
+            )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "optimize", str(exc))
-        print(f"\nERROR in Step 13 optimize: {exc}", file=sys.stderr)
+        ui.error(13, "optimize", exc, store.step_path(meta.run_id, "optimize"))
         return 1
 
     payload = result.summary_dict()
@@ -1911,16 +1927,14 @@ def cmd_optimize(args: argparse.Namespace) -> int:
 
     if print_explain:
         _explain_optimize(result)
-        print("\n=== checkpoint saved ===")
-        print(f"  run_id   : {meta.run_id}")
-        print(f"  step dir : {step_dir}")
-        print(
-            "  files    : output.json, recipe.yaml, recipe.tt, "
-            "pareto/, optimize_manifest.json, status.json, log.txt"
+        ui.checkpoint_saved(
+            run_id=meta.run_id,
+            step_dir=step_dir,
+            files=('output.json', 'recipe.yaml', 'recipe.tt', 'pareto/', 'optimize_manifest.json', 'status.json', 'log.txt'),
+            explain=True,
         )
-        print("\n" + store.summary(meta.run_id))
-        print("\n=== optimize summary (JSON) ===")
-        print(json.dumps(payload_out, indent=2))
+        ui.run_summary(store.summary(meta.run_id))
+        ui.json_panel(payload_out, title="optimize summary")
     else:
         print(json.dumps(payload_out, indent=2))
 
@@ -1953,14 +1967,15 @@ def cmd_export(args: argparse.Namespace) -> int:
 
     if store.is_step_done(meta.run_id, "export") and not args.force:
         out = store.read_step_output(meta.run_id, "export")
-        if print_explain:
-            print("Step 14 already checkpointed as done — loading from store.")
-            print(f"  path: {store.step_path(meta.run_id, 'export')}")
-            print("  (pass --force to re-run)\n")
-            print(json.dumps(out, indent=2))
-            print("\n" + store.summary(meta.run_id))
-        elif out:
-            print(json.dumps(out, indent=2))
+        ui.already_done(
+            14,
+            "export",
+            run_id=meta.run_id,
+            path=store.step_path(meta.run_id, "export"),
+            output=out,
+            summary=store.summary(meta.run_id) if print_explain else None,
+            explain=print_explain,
+        )
         return 0
 
     opt_dir = store.step_path(meta.run_id, "optimize")
@@ -2007,20 +2022,21 @@ def cmd_export(args: argparse.Namespace) -> int:
         return cmd_export(args)
 
     try:
-        result = export_gguf(
-            model_ref=meta.model_ref,
-            out_dir=step_dir,
-            gguf_in=gguf_in,
-            recipe_path=recipe_path,
-            recipe_tt=recipe_tt,
-            imatrix_path=imatrix_path,
-            mode=args.mode,
-            llama_quantize=args.llama_quantize,
-            base_type=args.base_type,
-        )
+        with ui.working('Exporting candidate GGUF…', explain=print_explain):
+            result = export_gguf(
+                model_ref=meta.model_ref,
+                out_dir=step_dir,
+                gguf_in=gguf_in,
+                recipe_path=recipe_path,
+                recipe_tt=recipe_tt,
+                imatrix_path=imatrix_path,
+                mode=args.mode,
+                llama_quantize=args.llama_quantize,
+                base_type=args.base_type,
+            )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "export", str(exc))
-        print(f"\nERROR in Step 14 export: {exc}", file=sys.stderr)
+        ui.error(14, "export", exc, store.step_path(meta.run_id, "export"))
         return 1
 
     payload = result.summary_dict()
@@ -2029,12 +2045,14 @@ def cmd_export(args: argparse.Namespace) -> int:
 
     if print_explain:
         _explain_export(result)
-        print("\n=== checkpoint saved ===")
-        print(f"  run_id   : {meta.run_id}")
-        print(f"  step dir : {step_dir}")
-        print("\n" + store.summary(meta.run_id))
-        print("\n=== export summary (JSON) ===")
-        print(json.dumps(payload, indent=2))
+        ui.checkpoint_saved(
+            run_id=meta.run_id,
+            step_dir=step_dir,
+            files=('input.json', 'output.json', 'status.json', 'log.txt'),
+            explain=True,
+        )
+        ui.run_summary(store.summary(meta.run_id))
+        ui.json_panel(payload, title="export summary")
     else:
         print(json.dumps(payload, indent=2))
 
@@ -2067,14 +2085,15 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
     if store.is_step_done(meta.run_id, "validate") and not args.force:
         out = store.read_step_output(meta.run_id, "validate")
-        if print_explain:
-            print("Step 15 already checkpointed as done — loading from store.")
-            print(f"  path: {store.step_path(meta.run_id, 'validate')}")
-            print("  (pass --force to re-run)\n")
-            print(json.dumps(out, indent=2))
-            print("\n" + store.summary(meta.run_id))
-        elif out:
-            print(json.dumps(out, indent=2))
+        ui.already_done(
+            15,
+            "validate",
+            run_id=meta.run_id,
+            path=store.step_path(meta.run_id, "validate"),
+            output=out,
+            summary=store.summary(meta.run_id) if print_explain else None,
+            explain=print_explain,
+        )
         return 0
 
     export_out = store.read_step_output(meta.run_id, "export") or {}
@@ -2126,23 +2145,24 @@ def cmd_validate(args: argparse.Namespace) -> int:
         return cmd_validate(args)
 
     try:
-        result = validate_and_release(
-            model_ref=meta.model_ref,
-            out_dir=step_dir,
-            recipe_path=recipe_path,
-            export_manifest=export_out,
-            specialty_domain=desc.get("specialty_domain"),
-            sensitivity_path=sens_path if sens_path.is_file() else None,
-            catalog=catalog,
-            assignments=assignments,
-            optimize_manifest=optimize_manifest,
-            resolve_descriptor=desc,
-            mode=args.mode,
-            allow_provisional=not args.strict,
-        )
+        with ui.working('Validating & staging release…', explain=print_explain):
+            result = validate_and_release(
+                model_ref=meta.model_ref,
+                out_dir=step_dir,
+                recipe_path=recipe_path,
+                export_manifest=export_out,
+                specialty_domain=desc.get("specialty_domain"),
+                sensitivity_path=sens_path if sens_path.is_file() else None,
+                catalog=catalog,
+                assignments=assignments,
+                optimize_manifest=optimize_manifest,
+                resolve_descriptor=desc,
+                mode=args.mode,
+                allow_provisional=not args.strict,
+            )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "validate", str(exc))
-        print(f"\nERROR in Step 15 validate: {exc}", file=sys.stderr)
+        ui.error(15, "validate", exc, store.step_path(meta.run_id, "validate"))
         return 1
 
     payload = result.summary_dict()
@@ -2161,12 +2181,14 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
     if print_explain:
         _explain_validate(result)
-        print("\n=== checkpoint saved ===")
-        print(f"  run_id   : {meta.run_id}")
-        print(f"  step dir : {step_dir}")
-        print("\n" + store.summary(meta.run_id))
-        print("\n=== validate summary (JSON) ===")
-        print(json.dumps(payload, indent=2))
+        ui.checkpoint_saved(
+            run_id=meta.run_id,
+            step_dir=step_dir,
+            files=('input.json', 'output.json', 'status.json', 'log.txt'),
+            explain=True,
+        )
+        ui.run_summary(store.summary(meta.run_id))
+        ui.json_panel(payload, title="validate summary")
     else:
         print(json.dumps(payload, indent=2))
 
@@ -2185,10 +2207,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     else:
         runs = store.list_runs()
         if not runs:
-            print("No runs yet. Run: odg resolve --model …")
+            ui.info("No runs yet. Run: odg resolve --model …")
             return 0
         meta = runs[0]
-    print(store.summary(meta.run_id))
+    ui.run_summary(store.summary(meta.run_id))
     return 0
 
 
@@ -2196,12 +2218,9 @@ def cmd_runs(args: argparse.Namespace) -> int:
     store = _store(args)
     runs = store.list_runs()
     if not runs:
-        print("No runs under", store.runs_dir)
+        ui.info(f"No runs under {store.runs_dir}")
         return 0
-    print(f"{'RUN_ID':<42} {'STATUS':<10} MODEL")
-    print("-" * 80)
-    for m in runs:
-        print(f"{m.run_id:<42} {m.status:<10} {m.model_ref}")
+    ui.runs_table(runs)
     return 0
 
 
@@ -2222,839 +2241,538 @@ def _require_run(store, *, model: str | None, run_id: str | None):
 
 
 def _banner(model: str, run_id: str, root: str) -> None:
-    print(
-        """
-╔══════════════════════════════════════════════════════════════╗
-║  OpenDynamicGGUF — Step 01: Resolve model                   ║
-╚══════════════════════════════════════════════════════════════╝
-""".rstrip()
-    )
-    print(
-        f"""
-What this step does
--------------------
-  Input : {model}
-  Mode  : Ollama tags → use LOCAL Ollama GGUF by default (no HF login).
-          Pass --prefer-hf later for original BF16 from Hugging Face.
-
-  Checkpoint store
-  ----------------
-  run_id : {run_id}
-  root   : {root}
-  Each step writes durable files so you can resume after a crash.
-
-  This step does NOT load the neural net and does NOT quantize.
-""".rstrip()
+    ui.step_banner(
+        1,
+        "Resolve model",
+        model=model,
+        run_id=run_id,
+        root=root,
+        goal="Turn a model ref into a durable local path + architecture descriptor.",
+        bullets=[
+            "Ollama tags → local GGUF by default (no HF login)",
+            "Pass --prefer-hf for original BF16 from Hugging Face",
+            "Does NOT load the neural net and does NOT quantize",
+        ],
     )
 
 
 def _banner_load(model: str, run_id: str, root: str) -> None:
-    print(
-        """
-╔══════════════════════════════════════════════════════════════╗
-║  OpenDynamicGGUF — Step 02: Load model                      ║
-╚══════════════════════════════════════════════════════════════╝
-""".rstrip()
+    ui.step_banner(
+        2,
+        "Load model",
+        model=model,
+        run_id=run_id,
+        root=root,
+        goal="Open weights and parse header + tensor index.",
+        bullets=[
+            "Input: Step 01 resolve output (local_path)",
+            "For Ollama GGUF: index tensors without dequantizing all weights into RAM",
+        ],
     )
-    print(
-        f"""
-What this step does
--------------------
-  Input : Step 01 resolve output (local_path)
-  Model : {model}
 
-  For Ollama GGUF: open the file, parse header + tensor index
-  (does NOT dequantize all weights into BF16 RAM).
 
-  Checkpoint
-  ----------
-  run_id : {run_id}
-  root   : {root}
-""".rstrip()
+def _banner_enumerate(model: str, run_id: str, root: str) -> None:
+    ui.step_banner(
+        3,
+        "Enumerate tensors",
+        model=model,
+        run_id=run_id,
+        root=root,
+        goal="Flat inventory of every tensor (name, shape, dtype, nbytes).",
+        bullets=["No roles yet — that is Step 04"],
+    )
+
+
+def _banner_classify(model: str, run_id: str, root: str) -> None:
+    ui.step_banner(
+        4,
+        "Classify tensors",
+        model=model,
+        run_id=run_id,
+        root=root,
+        goal="Assign role, depth bucket, group_id, and quantizable flag.",
+        bullets=["Roles: attn_q, ffn_up, norm, …"],
     )
 
 
 def _banner_catalog(model: str, run_id: str, root: str) -> None:
-    print(
-        """
-╔══════════════════════════════════════════════════════════════╗
-║  OpenDynamicGGUF — Step 05: Build tensor catalog            ║
-╚══════════════════════════════════════════════════════════════╝
-""".rstrip()
+    ui.step_banner(
+        5,
+        "Build tensor catalog",
+        model=model,
+        run_id=run_id,
+        root=root,
+        goal="Canonical tensor_catalog.json (names + groups + provenance).",
+        bullets=["Merges classify + load + resolve into one durable catalog"],
     )
-    print(
-        f"""
-What this step does
--------------------
-  Input : Step 04 classified.json (+ resolve/load provenance)
-  Model : {model}
-  Goal  : Single source-of-truth tensor_catalog.json with
-          gguf/hf names, roles, groups, and feature slots.
-
-  Checkpoint
-  ----------
-  run_id : {run_id}
-  root   : {root}
-""".rstrip()
-    )
-
-
-def _explain_catalog(catalog) -> None:
-    print("\n=== what happened ===")
-    for line in catalog.steps_log:
-        print(f"  • {line}")
-
-    print("\n=== verdict ===")
-    print(f"  ✓ Tensors            : {catalog.n_tensors}")
-    print(f"  ✓ Groups             : {catalog.n_groups}")
-    print(f"  ✓ Quantizable        : {catalog.n_quantizable}")
-    print(f"  ✓ catalog_sha256     : {catalog.catalog_sha256[:24]}…")
-    print(f"  ✓ source_sha256      : {(catalog.source_sha256 or '-')[:24]}…")
-    print(f"  ✓ Backend            : {catalog.source_backend}")
-
-    print("\n=== sample catalog entries ===")
-    for i, (name, t) in enumerate(catalog.tensors.items()):
-        if i >= 6:
-            break
-        print(f"  {name}")
-        print(f"      role={t.role} depth={t.depth} group={t.group_id} Q={t.quantizable}")
-        print(f"      hf_name={t.hf_name}")
-
-    print("\n=== next ===")
-    print("  Step 06 — compute weight features (fill weight_features slots).")
 
 
 def _banner_weight_features(model: str, run_id: str, root: str) -> None:
-    print(
-        """
-╔══════════════════════════════════════════════════════════════╗
-║  OpenDynamicGGUF — Step 06: Weight features                 ║
-╚══════════════════════════════════════════════════════════════╝
-""".rstrip()
+    ui.step_banner(
+        6,
+        "Weight features",
+        model=model,
+        run_id=run_id,
+        root=root,
+        goal="Per-tensor / per-group weight statistics that prioritize probes.",
+        bullets=["Dequant GGUF tensors as needed; features prioritize, ΔKLD decides"],
     )
-    print(
-        f"""
-What this step does
--------------------
-  Input : Step 05 tensor_catalog.json + GGUF weights
-  Model : {model}
-  Goal  : Cheap per-tensor stats (mean/var/sparsity/outliers/norms)
-          to RANK which groups to probe first — not final bits.
-
-  Checkpoint
-  ----------
-  run_id : {run_id}
-  root   : {root}
-""".rstrip()
-    )
-
-
-def _explain_weight_features(result) -> None:
-    print("\n=== what happened ===")
-    for line in result.steps_log:
-        print(f"  • {line}")
-
-    print("\n=== verdict ===")
-    print(f"  ✓ Features filled   : {result.n_with_features}/{result.n_tensors}")
-    print(f"  ✓ Skipped           : {result.n_skipped}")
-    print(f"  ✓ catalog_sha256    : {result.catalog_sha256[:24]}…")
-    print(f"  ✓ Source quantized  : {result.source_is_quantized}")
-
-    print("\n=== hardest groups (probe these carefully) ===")
-    for g in result.hardest_groups[:5]:
-        print(
-            f"  {g['group_id']:<22} hardness={g.get('hardness', 0):.4f} "
-            f"outlier={g.get('outlier_ratio_mean', 0):.4f} "
-            f"var={g.get('variance_mean', 0):.6f}"
-        )
-
-    print("\n=== easiest groups ===")
-    for g in result.easiest_groups[:5]:
-        print(
-            f"  {g['group_id']:<22} hardness={g.get('hardness', 0):.4f} "
-            f"sparsity={g.get('sparsity_mean', 0):.3f}"
-        )
-
-    if result.notes:
-        print("\n=== notes ===")
-        for n in result.notes:
-            print(f"  • {n}")
-
-    print("\n=== next ===")
-    print("  Step 07 — build calibration corpus (calib / search / held-out).")
 
 
 def _banner_corpus(model: str, run_id: str, root: str) -> None:
-    print(
-        """
-╔══════════════════════════════════════════════════════════════╗
-║  OpenDynamicGGUF — Step 07: Calibration corpus              ║
-╚══════════════════════════════════════════════════════════════╝
-""".rstrip()
+    ui.step_banner(
+        7,
+        "Calibration corpus",
+        model=model,
+        run_id=run_id,
+        root=root,
+        goal="Build train / calib / held-out prompt banks with chat template.",
+        bullets=["Held-out never used for search — only final validation"],
     )
-    print(
-        f"""
-What this step does
--------------------
-  Input : Resolve descriptor (chat_template, specialty_domain)
-  Model : {model}
-  Goal  : Mixed-domain prompts → chat template → 60/20/20 split
-          calib.txt / search.txt / heldout.txt
-
-  Hard rule: heldout is for validation ONLY (never for search).
-
-  Checkpoint
-  ----------
-  run_id : {run_id}
-  root   : {root}
-""".rstrip()
-    )
-
-
-def _explain_corpus(result) -> None:
-    print("\n=== what happened ===")
-    for line in result.steps_log:
-        print(f"  • {line}")
-
-    print("\n=== verdict ===")
-    print(f"  ✓ Documents          : {result.n_documents}")
-    print(
-        f"  ✓ Split              : calib={result.n_calib} "
-        f"search={result.n_search} heldout={result.n_heldout}"
-    )
-    print(
-        f"  ✓ Tokens (est)       : total={result.tokens_est_total} "
-        f"calib={result.tokens_est_calib} "
-        f"search={result.tokens_est_search} "
-        f"heldout={result.tokens_est_heldout}"
-    )
-    print(f"  ✓ Template           : {result.chat_template}")
-    print(f"  ✓ Specialty          : {result.specialty_domain}")
-    print(f"  ✓ Domains            : {result.domain_counts}")
-
-    print("\n=== files ===")
-    for k, p in result.files.items():
-        print(f"  {k:<8} {p}")
-
-    if result.notes:
-        print("\n=== notes ===")
-        for n in result.notes:
-            print(f"  • {n}")
-
-    print("\n=== next ===")
-    print("  Step 08 — activation features (needs calib.txt + a forward pass).")
 
 
 def _banner_activation_features(model: str, run_id: str, root: str) -> None:
-    print(
-        """
-╔══════════════════════════════════════════════════════════════╗
-║  OpenDynamicGGUF — Step 08: Activation features             ║
-╚══════════════════════════════════════════════════════════════╝
-""".rstrip()
+    ui.step_banner(
+        8,
+        "Activation features",
+        model=model,
+        run_id=run_id,
+        root=root,
+        goal="Activation / routing stats (or proxy) to refine probe priority.",
+        bullets=["Prefers real forward passes when torch + HF weights available"],
     )
-    print(
-        f"""
-What this step does
--------------------
-  Input : calib.txt + catalog (weight_features) + optional BF16 HF model
-  Model : {model}
-  Goal  : Per-tensor activation range / outliers for probe ranking.
-          Prefer real forward hooks; proxy_from_weights if no BF16.
-
-  Checkpoint
-  ----------
-  run_id : {run_id}
-  root   : {root}
-""".rstrip()
-    )
-
-
-def _explain_activation_features(result) -> None:
-    print("\n=== what happened ===")
-    for line in result.steps_log:
-        print(f"  • {line}")
-
-    print("\n=== verdict ===")
-    print(f"  ✓ Method            : {result.method}")
-    print(f"  ✓ Features filled   : {result.n_with_features}/{result.n_tensors}")
-    print(f"  ✓ Calib docs used   : {result.n_docs_used} (tokens_est≈{result.n_tokens_est})")
-    print(f"  ✓ catalog_sha256    : {result.catalog_sha256[:24]}…")
-
-    print("\n=== hardest groups (activation) ===")
-    for g in result.hardest_groups[:5]:
-        print(
-            f"  {g['group_id']:<22} hardness={g.get('hardness', 0):.4f} "
-            f"absmax={g.get('absmax', 0):.4f} "
-            f"outlier={g.get('outlier_ratio', 0):.4f}"
-        )
-
-    print("\n=== easiest groups ===")
-    for g in result.easiest_groups[:5]:
-        print(
-            f"  {g['group_id']:<22} hardness={g.get('hardness', 0):.4f} "
-            f"absmax={g.get('absmax', 0):.4f}"
-        )
-
-    if result.notes:
-        print("\n=== notes ===")
-        for n in result.notes:
-            print(f"  • {n}")
-
-    print("\n=== next ===")
-    print("  Step 09 — freeze BF16 GGUF for llama.cpp (imatrix / probes).")
 
 
 def _banner_freeze_gguf(model: str, run_id: str, root: str) -> None:
-    print(
-        """
-╔══════════════════════════════════════════════════════════════╗
-║  OpenDynamicGGUF — Step 09: Freeze GGUF reference           ║
-╚══════════════════════════════════════════════════════════════╝
-""".rstrip()
+    ui.step_banner(
+        9,
+        "Freeze reference GGUF",
+        model=model,
+        run_id=run_id,
+        root=root,
+        goal="Freeze the reference GGUF used for imatrix / logits / export.",
+        bullets=["Promotes Ollama/HF source into a stable model-ref.gguf"],
     )
-    print(
-        f"""
-What this step does
--------------------
-  Input : HF BF16 dir (ideal) or working GGUF from resolve/load
-  Model : {model}
-  Goal  : One hashed GGUF file for imatrix / probes / export.
-          Ideal: convert_hf_to_gguf.py --outtype bf16
-          Now:   promote Ollama/Q8 GGUF if BF16 convert unavailable.
-
-  Checkpoint
-  ----------
-  run_id : {run_id}
-  root   : {root}
-""".rstrip()
-    )
-
-
-def _explain_freeze_gguf(result) -> None:
-    print("\n=== what happened ===")
-    for line in result.steps_log:
-        print(f"  • {line}")
-
-    print("\n=== verdict ===")
-    print(f"  ✓ Method            : {result.method}")
-    print(f"  ✓ GGUF              : {result.gguf_path}")
-    print(f"  ✓ sha256            : {result.gguf_sha256[:32]}…")
-    print(f"  ✓ Size              : {result.gguf_nbytes / (1024**2):.1f} MiB")
-    print(f"  ✓ BF16 reference    : {result.is_bf16_reference}")
-    print(f"  ✓ dtypes            : {result.dtype_summary}")
-    print(f"  ✓ Catalog match     : {result.catalog_match}")
-
-    if result.notes:
-        print("\n=== notes ===")
-        for n in result.notes:
-            print(f"  • {n}")
-
-    print("\n=== next ===")
-    print("  Step 10 — build imatrix from calib.txt + this frozen GGUF.")
 
 
 def _banner_imatrix(model: str, run_id: str, root: str) -> None:
-    print(
-        """
-╔══════════════════════════════════════════════════════════════╗
-║  OpenDynamicGGUF — Step 10: Build imatrix                   ║
-╚══════════════════════════════════════════════════════════════╝
-""".rstrip()
+    ui.step_banner(
+        10,
+        "Importance matrix",
+        model=model,
+        run_id=run_id,
+        root=root,
+        goal="Collect importance stats for llama-quantize (or proxy).",
+        bullets=["Uses llama-imatrix when LLAMA_CPP_DIR is set"],
     )
-    print(
-        f"""
-What this step does
--------------------
-  Input : frozen GGUF (Step 09) + calib.txt (Step 07) — never heldout
-  Model : {model}
-  Goal  : Activation importance for llama-quantize rounding.
-          Ideal: llama-imatrix → imatrix.gguf
-          Fallback: imatrix_proxy.json from weight/activation features
-
-  Checkpoint
-  ----------
-  run_id : {run_id}
-  root   : {root}
-""".rstrip()
-    )
-
-
-def _explain_imatrix(result) -> None:
-    print("\n=== what happened ===")
-    for line in result.steps_log:
-        print(f"  • {line}")
-
-    print("\n=== verdict ===")
-    print(f"  ✓ Method            : {result.method}")
-    print(f"  ✓ GGUF sha          : {(result.gguf_sha256 or '-')[:24]}…")
-    print(f"  ✓ imatrix.gguf      : {result.imatrix_path or '(not produced)'}")
-    print(f"  ✓ imatrix sha       : {(result.imatrix_sha256 or '-')[:24]}…")
-    print(f"  ✓ proxy json        : {result.proxy_path or '-'}")
-    print(f"  ✓ Tensors scored    : {result.n_tensors_scored}")
-
-    if result.notes:
-        print("\n=== notes ===")
-        for n in result.notes:
-            print(f"  • {n}")
-
-    print("\n=== next ===")
-    print("  Step 11 — cache reference logits on search/heldout splits.")
 
 
 def _banner_reference_logits(model: str, run_id: str, root: str) -> None:
-    print(
-        """
-╔══════════════════════════════════════════════════════════════╗
-║  OpenDynamicGGUF — Step 11: Reference logits                ║
-╚══════════════════════════════════════════════════════════════╝
-""".rstrip()
+    ui.step_banner(
+        11,
+        "Reference logits",
+        model=model,
+        run_id=run_id,
+        root=root,
+        goal="Cache reference logits for ΔKLD probes and held-out gates.",
+        bullets=["Manifest + markers when llama.cpp / runner is missing"],
     )
-    print(
-        f"""
-What this step does
--------------------
-  Input : frozen GGUF + search.txt + heldout.txt (never calib)
-  Model : {model}
-  Goal  : Cache P_ref logits so every candidate can be scored with
-          KL(P_ref ‖ P_quant) without re-running the reference model.
-
-  Checkpoint
-  ----------
-  run_id : {run_id}
-  root   : {root}
-""".rstrip()
-    )
-
-
-def _explain_reference_logits(result) -> None:
-    print("\n=== what happened ===")
-    for line in result.steps_log:
-        print(f"  • {line}")
-
-    print("\n=== verdict ===")
-    print(f"  ✓ Method            : {result.method}")
-    print(f"  ✓ cache_key         : {result.cache_key[:32]}…")
-    print(f"  ✓ logits-search     : {result.logits_search_path or '(missing)'}")
-    print(f"  ✓ logits-heldout    : {result.logits_heldout_path or '(missing)'}")
-
-    if result.notes:
-        print("\n=== notes ===")
-        for n in result.notes:
-            print(f"  • {n}")
-
-    print("\n=== next ===")
-    print("  Step 12 — sensitivity probe (trial-quantize groups; measure ΔKLD).")
 
 
 def _banner_sensitivity(model: str, run_id: str, root: str) -> None:
-    print(
-        """
-╔══════════════════════════════════════════════════════════════╗
-║  OpenDynamicGGUF — Step 12: Sensitivity probe               ║
-╚══════════════════════════════════════════════════════════════╝
-""".rstrip()
+    ui.step_banner(
+        12,
+        "Sensitivity table",
+        model=model,
+        run_id=run_id,
+        root=root,
+        goal="Probe ΔKLD vs Δbytes per group × quant candidate.",
+        bullets=["Features prioritize; measured ΔKLD decides"],
     )
-    print(
-        f"""
-What this step does
--------------------
-  Input : catalog + features + imatrix proxy + search split
-  Model : {model}
-  Goal  : For each group × quant type, estimate/measure
-          (Δbytes, ΔKLD) — the table Step 13 optimizes over.
-          Features prioritize; probes decide (when llama tools exist).
-
-  Checkpoint
-  ----------
-  run_id : {run_id}
-  root   : {root}
-""".rstrip()
-    )
-
-
-def _explain_sensitivity(result) -> None:
-    print("\n=== what happened ===")
-    for line in result.steps_log:
-        print(f"  • {line}")
-
-    print("\n=== verdict ===")
-    print(f"  ✓ Method            : {result.method}")
-    print(f"  ✓ Groups probed     : {result.n_groups_probed}")
-    print(f"  ✓ Table rows        : {result.n_rows}")
-    print(f"  ✓ Baseline / probes : {result.baseline_type} / {result.probe_types}")
-
-    print("\n=== best efficiency (bytes_saved / ΔKLD) ===")
-    for r in result.top_efficiency[:6]:
-        print(
-            f"  {r['group_id']:<20} {r['probe']:<6} "
-            f"ΔB={r['delta_bytes']:>10}  ΔKLD={r['delta_kld']:.4f}  "
-            f"eff={r['efficiency']:.2e}  {r['decision_hint']}"
-        )
-
-    if result.pinned_hints:
-        print("\n=== pin-high hints (sensitive @ Q4) ===")
-        for r in result.pinned_hints[:5]:
-            print(
-                f"  {r['group_id']:<20} ΔKLD={r['delta_kld']:.4f}"
-            )
-
-    if result.notes:
-        print("\n=== notes ===")
-        for n in result.notes:
-            print(f"  • {n}")
-
-    print("\n=== next ===")
-    print("  Step 13 — optimize recipe (maximize bytes saved / ΔKLD under budget).")
 
 
 def _banner_optimize(model: str, run_id: str, root: str) -> None:
-    print(
-        """
-╔══════════════════════════════════════════════════════════════╗
-║  OpenDynamicGGUF — Step 13: Optimize recipe                 ║
-╚══════════════════════════════════════════════════════════════╝
-""".rstrip()
+    ui.step_banner(
+        13,
+        "Optimize recipe",
+        model=model,
+        run_id=run_id,
+        root=root,
+        goal="Greedy knapsack → recipe.yaml / recipe.tt + Pareto frontier.",
+        bullets=["Respects size / quality budgets from sensitivity table"],
     )
-    print(
-        f"""
-What this step does
--------------------
-  Input : sensitivity.json (Step 12)
-  Model : {model}
-  Goal  : Greedy knapsack — assign per-group quant types under a
-          size budget; emit recipe.yaml + recipe.tt + Pareto set.
-
-  Checkpoint
-  ----------
-  run_id : {run_id}
-  root   : {root}
-""".rstrip()
-    )
-
-
-def _explain_optimize(result) -> None:
-    print("\n=== what happened ===")
-    for line in result.steps_log:
-        print(f"  • {line}")
-
-    print("\n=== verdict ===")
-    print(f"  ✓ Method            : {result.method}")
-    print(
-        f"  ✓ Budget / estimate : "
-        f"{result.budget_bytes / (1024**2):.1f} / "
-        f"{result.estimated_bytes / (1024**2):.1f} MiB"
-    )
-    print(f"  ✓ Pred. mean ΔKLD   : {result.predicted_delta_kld:.4f}")
-    print(f"  ✓ Groups assigned   : {result.n_groups}")
-    print(f"  ✓ recipe.yaml       : {result.recipe_path}")
-    print(f"  ✓ recipe.tt         : {result.tensor_type_file}")
-    print(f"  ✓ Pareto recipes    : {len(result.pareto_paths)}")
-
-    print("\n=== sample assignments ===")
-    for i, (gid, q) in enumerate(sorted(result.assignments.items())):
-        if i >= 12:
-            print(f"  … ({len(result.assignments) - 12} more)")
-            break
-        print(f"  {gid:<22} → {q}")
-
-    if result.notes:
-        print("\n=== notes ===")
-        for n in result.notes:
-            print(f"  • {n}")
-
-    print("\n=== next ===")
-    print("  Step 14 — export GGUF from recipe (llama-quantize + imatrix).")
 
 
 def _banner_export(model: str, run_id: str, root: str) -> None:
-    print(
-        """
-╔══════════════════════════════════════════════════════════════╗
-║  OpenDynamicGGUF — Step 14: Export GGUF                     ║
-╚══════════════════════════════════════════════════════════════╝
-""".rstrip()
+    ui.step_banner(
+        14,
+        "Export GGUF",
+        model=model,
+        run_id=run_id,
+        root=root,
+        goal="Apply recipe via llama-quantize (or dry-run command script).",
+        bullets=["Writes candidate GGUF or quantize_command.sh"],
     )
-    print(
-        f"""
-What this step does
--------------------
-  Input : recipe.yaml + recipe.tt + frozen GGUF (+ imatrix if present)
-  Model : {model}
-  Goal  : llama-quantize → candidate *-UD.gguf with provenance.
-          Dry-run writes the exact command when tools are missing.
-
-  Checkpoint
-  ----------
-  run_id : {run_id}
-  root   : {root}
-""".rstrip()
-    )
-
-
-def _explain_export(result) -> None:
-    print("\n=== what happened ===")
-    for line in result.steps_log:
-        print(f"  • {line}")
-
-    print("\n=== verdict ===")
-    print(f"  ✓ Method            : {result.method}")
-    print(f"  ✓ Output GGUF       : {result.gguf_out or '(dry-run / missing)'}")
-    if result.gguf_out_nbytes:
-        print(f"  ✓ Size              : {result.gguf_out_nbytes / (1024**2):.1f} MiB")
-    if result.estimated_bytes:
-        print(f"  ✓ Recipe estimate   : {result.estimated_bytes / (1024**2):.1f} MiB")
-    print(f"  ✓ Command           : {' '.join(result.command[:6])} …")
-
-    if result.notes:
-        print("\n=== notes ===")
-        for n in result.notes:
-            print(f"  • {n}")
-
-    print("\n=== next ===")
-    print("  Step 15 — validate on held-out; stage release or feedback.")
 
 
 def _banner_validate(model: str, run_id: str, root: str) -> None:
-    print(
-        """
-╔══════════════════════════════════════════════════════════════╗
-║  OpenDynamicGGUF — Step 15: Validate & release              ║
-╚══════════════════════════════════════════════════════════════╝
-""".rstrip()
+    ui.step_banner(
+        15,
+        "Validate & release",
+        model=model,
+        run_id=run_id,
+        root=root,
+        goal="Tiered gates → RELEASE / PROVISIONAL / FAIL + report card.",
+        bullets=["Held-out only — never search/calib for final judgment"],
     )
-    print(
-        f"""
-What this step does
--------------------
-  Input : candidate GGUF + recipe + held-out logits (when present)
-  Model : {model}
-  Goal  : Tiered gates → RELEASE / PROVISIONAL / FAIL + report.
-          Held-out only — never search/calib for final judgment.
-
-  Checkpoint
-  ----------
-  run_id : {run_id}
-  root   : {root}
-""".rstrip()
-    )
-
-
-def _explain_validate(result) -> None:
-    print("\n=== what happened ===")
-    for line in result.steps_log:
-        print(f"  • {line}")
-
-    print("\n=== verdict ===")
-    print(f"  ✓ Verdict           : {result.verdict}")
-    print(f"  ✓ Method            : {result.method}")
-    print(f"  ✓ Tier1 pass        : {result.tier1.get('pass')}")
-    print(f"  ✓ Tier2 pass        : {result.tier2.get('pass')}")
-    print(f"  ✓ Report            : {result.report_path}")
-    print(f"  ✓ Release dir       : {result.release_dir or '-'}")
-    if result.report_card_paths:
-        print(f"  ✓ Report card HTML  : {result.report_card_paths.get('html')}")
-        print(f"  ✓ Report card MD    : {result.report_card_paths.get('md')}")
-
-    if result.feedback:
-        print("\n=== feedback to optimizer ===")
-        for f in result.feedback:
-            print(f"  • {f.get('constraint')}: {f.get('action')}")
-
-    if result.notes:
-        print("\n=== notes ===")
-        for n in result.notes:
-            print(f"  • {n}")
-
-    print("\n=== pipeline ===")
-    print("  Steps 01–15 complete (plumbing). Install llama.cpp for real quant/KLD.")
-    if result.report_card_paths.get("html"):
-        print(f"  Open report card: {result.report_card_paths['html']}")
-
-
-def _banner_classify(model: str, run_id: str, root: str) -> None:
-    print(
-        """
-╔══════════════════════════════════════════════════════════════╗
-║  OpenDynamicGGUF — Step 04: Classify tensors                ║
-╚══════════════════════════════════════════════════════════════╝
-""".rstrip()
-    )
-    print(
-        f"""
-What this step does
--------------------
-  Input : Step 03 tensors.json
-  Model : {model}
-  Goal  : Assign role (attn_q, ffn_up, norm, …), depth bucket,
-          group_id, and quantizable flag to every tensor.
-
-  Checkpoint
-  ----------
-  run_id : {run_id}
-  root   : {root}
-""".rstrip()
-    )
-
-
-def _explain_classify(result) -> None:
-    print("\n=== what happened ===")
-    for line in result.steps_log:
-        print(f"  • {line}")
-
-    print("\n=== verdict ===")
-    print(f"  ✓ Tensors            : {result.n_tensors}")
-    print(f"  ✓ Layers             : {result.n_layers}")
-    print(f"  ✓ Coverage           : {result.coverage:.1%} (non-other)")
-    print(f"  ✓ Role summary       : {result.role_summary}")
-    print(f"  ✓ Quantizable        : {result.quantizable_summary}")
-    print(f"  ✓ Probe groups       : {len(result.group_summary)}")
-
-    print("\n=== groups (role@depth) ===")
-    for gid, n in list(result.group_summary.items())[:20]:
-        print(f"  {gid:28} {n:4} tensors")
-    if len(result.group_summary) > 20:
-        print(f"  … +{len(result.group_summary) - 20} more")
-
-    print("\n=== sample ===")
-    for t in result.tensors[:12]:
-        q = "Q" if t.quantizable else "—"
-        print(
-            f"  [{q}] {t.role:12} {t.depth or '-':7}  {t.name}"
-        )
-
-    if result.other_names:
-        print("\n  unmatched:")
-        for n in result.other_names[:10]:
-            print(f"    - {n}")
-
-    print("\n=== next ===")
-    print("  Step 05 — build tensor_catalog.json (HF/GGUF names + groups).")
-
-
-def _banner_enumerate(model: str, run_id: str, root: str) -> None:
-    print(
-        """
-╔══════════════════════════════════════════════════════════════╗
-║  OpenDynamicGGUF — Step 03: Enumerate tensors               ║
-╚══════════════════════════════════════════════════════════════╝
-""".rstrip()
-    )
-    print(
-        f"""
-What this step does
--------------------
-  Input : Step 02 tensor_index.json
-  Model : {model}
-  Goal  : Flat inventory of EVERY tensor (name, shape, dtype, nbytes).
-          No roles yet — that is Step 04.
-
-  Checkpoint
-  ----------
-  run_id : {run_id}
-  root   : {root}
-""".rstrip()
-    )
-
-
-def _explain_enumerate(result) -> None:
-    print("\n=== what happened ===")
-    for line in result.steps_log:
-        print(f"  • {line}")
-
-    print("\n=== verdict ===")
-    print(f"  ✓ Tensors            : {result.n_tensors}")
-    print(f"  ✓ Total elements     : {result.total_elements:,}")
-    print(f"  ✓ Approx nbytes      : {result.total_nbytes:,}")
-    print(f"  ✓ Dtype summary      : {result.dtype_summary}")
-
-    print("\n=== by layer (tensor counts) ===")
-    # show compact: global + first/last few layers
-    items = list(result.layer_summary.items())
-    for k, v in items[:6]:
-        print(f"  layer {k:>6}: {v} tensors")
-    if len(items) > 8:
-        print("  …")
-        for k, v in items[-2:]:
-            print(f"  layer {k:>6}: {v} tensors")
-
-    print("\n=== sample (sorted by name) ===")
-    for t in result.tensors[:10]:
-        shape = "×".join(str(d) for d in t.shape)
-        print(f"  {t.name:42} {shape:16} {t.dtype:6}  {t.nbytes:>10,} B")
-
-    print("\n=== next ===")
-    print("  Step 04 — classify each tensor into a role (attn_q, ffn_up, norm, …).")
-
-
-def _explain_load(loaded) -> None:
-    print("\n=== what happened ===")
-    for line in loaded.steps_log:
-        print(f"  • {line}")
-
-    print("\n=== verdict ===")
-    print(f"  ✓ Backend            : {loaded.backend}")
-    print(f"  ✓ Source path        : {loaded.source_path}")
-    print(f"  ✓ Tensors indexed    : {loaded.n_tensors}")
-    print(f"  ✓ File size          : {loaded.file_size_bytes:,} bytes")
-    print(f"  ✓ Architecture       : {loaded.architecture}")
-    print(f"  ✓ Layers / embed     : {loaded.layer_count} / {loaded.embedding_length}")
-    print(f"  ✓ Vocab size         : {loaded.vocab_size}")
-    print(f"  ✓ Quantized source?  : {loaded.source_is_quantized}")
-    print(f"  ✓ Dtype summary      : {loaded.dtype_summary}")
-    if loaded.sample_tensors:
-        print("\n=== sample tensors ===")
-        for t in loaded.sample_tensors[:8]:
-            print(f"  {t.name:40} shape={t.shape}  dtype={t.dtype}")
-    if loaded.notes:
-        print("\n  notes:")
-        for n in loaded.notes:
-            print(f"    - {n}")
-    print("\n=== next ===")
-    print("  Step 03 — enumerate/classify every tensor into the catalog.")
 
 
 def _explain(result) -> None:
-    print("\n=== what happened ===")
-    for line in result.steps_log:
-        print(f"  • {line}")
-
-    print("\n=== verdict ===")
-    print(f"  ✓ Kind                : {result.kind.value}")
-    print(f"  ✓ Working local_path  : {result.local_path}")
-    print(f"  ✓ Weights ready       : {result.weights_ready}")
-    print(f"  ✓ Source quantized?   : {result.source_is_quantized}")
-    print(f"  ✓ Upstream HF (later) : {result.hf_repo_id}")
+    ui.section("what happened")
+    ui.bullets(result.steps_log)
+    ui.section("verdict")
+    ui.kv(
+        [
+            ("Kind", result.kind.value),
+            ("Working local_path", result.local_path),
+            ("Weights ready", result.weights_ready),
+            ("Source quantized?", result.source_is_quantized),
+            ("Upstream HF (later)", result.hf_repo_id),
+        ]
+    )
     if result.rejected_quantized_source:
-        print(f"  · Note: {result.rejected_quantized_source}")
-
+        ui.warn(str(result.rejected_quantized_source))
     d = result.descriptor
-    print("\n=== architecture descriptor ===")
-    print(f"  family            : {d.family}")
-    print(f"  layer_count       : {d.layer_count}")
-    print(f"  embedding_length  : {d.embedding_length}")
-    print(f"  parameter_count   : {d.parameter_count}")
-    print(f"  context_length    : {d.context_length}")
-    print(f"  specialty_domain  : {d.specialty_domain}")
-    print(f"  ollama_quant      : {d.ollama_quantization}")
+    ui.section("architecture descriptor")
+    ui.kv(
+        [
+            ("family", d.family),
+            ("layer_count", d.layer_count),
+            ("embedding_length", d.embedding_length),
+            ("parameter_count", d.parameter_count),
+            ("context_length", d.context_length),
+            ("specialty_domain", d.specialty_domain),
+            ("ollama_quant", d.ollama_quantization),
+        ],
+        check=False,
+    )
     if d.notes:
-        print("  notes:")
-        for n in d.notes:
-            print(f"    - {n}")
-
-    print("\n=== next ===")
+        ui.notes(d.notes)
     if result.weights_ready and result.local_path:
-        print("  Local weights ready → proceed to Step 02 (inspect / catalog).")
+        msg = "Local weights ready → proceed to Step 02 (inspect / catalog)."
         if result.source_is_quantized:
-            print(
-                "  Warning: source is already quantized. Fine for pipeline plumbing;\n"
-                "  for real dynamic quant quality, later switch to --prefer-hf BF16."
+            msg += (
+                "\nSource is already quantized — fine for plumbing; "
+                "for real dynamic quant quality later use --prefer-hf BF16."
             )
+        ui.next_step(msg)
     else:
-        print(
-            "  Weights not ready. For Ollama tags, re-run without --prefer-hf,\n"
-            "  or login to Hugging Face and use --prefer-hf --download-weights."
+        ui.next_step(
+            "Weights not ready. For Ollama tags, re-run without --prefer-hf, "
+            "or login to Hugging Face and use --prefer-hf --download-weights."
         )
+
+
+def _explain_load(loaded) -> None:
+    ui.section("what happened")
+    ui.bullets(loaded.steps_log)
+    ui.section("verdict")
+    ui.kv(
+        [
+            ("Backend", loaded.backend),
+            ("Source path", loaded.source_path),
+            ("Tensors indexed", loaded.n_tensors),
+            ("File size", f"{loaded.file_size_bytes:,} bytes"),
+            ("Architecture", loaded.architecture),
+            ("Layers / embed", f"{loaded.layer_count} / {loaded.embedding_length}"),
+            ("Vocab size", loaded.vocab_size),
+            ("Quantized source?", loaded.source_is_quantized),
+            ("Dtype summary", loaded.dtype_summary),
+        ]
+    )
+    if loaded.sample_tensors:
+        ui.section("sample tensors")
+        ui.bullets(
+            [f"{t.name:40} shape={t.shape}  dtype={t.dtype}" for t in loaded.sample_tensors[:8]]
+        )
+    if loaded.notes:
+        ui.notes(loaded.notes)
+    ui.next_step("Step 03 — enumerate/classify every tensor into the catalog.")
+
+
+def _explain_enumerate(result) -> None:
+    ui.section("what happened")
+    ui.bullets(result.steps_log)
+    ui.section("verdict")
+    ui.kv(
+        [
+            ("Tensors", result.n_tensors),
+            ("Total elements", f"{result.total_elements:,}"),
+            ("Approx nbytes", f"{result.total_nbytes:,}"),
+            ("Dtype summary", result.dtype_summary),
+        ]
+    )
+    ui.section("by layer (tensor counts)")
+    items = list(result.layer_summary.items())
+    rows = [f"layer {k:>6}: {v} tensors" for k, v in items[:6]]
+    if len(items) > 8:
+        rows.append("…")
+        rows.extend(f"layer {k:>6}: {v} tensors" for k, v in items[-2:])
+    ui.bullets(rows)
+    ui.section("sample (sorted by name)")
+    ui.bullets(
+        [
+            f"{t.name:42} {'×'.join(str(d) for d in t.shape):16} {t.dtype:6}  {t.nbytes:>10,} B"
+            for t in result.tensors[:10]
+        ]
+    )
+    ui.next_step("Step 04 — classify each tensor into a role (attn_q, ffn_up, norm, …).")
+
+
+def _explain_classify(result) -> None:
+    ui.section("what happened")
+    ui.bullets(result.steps_log)
+    ui.section("verdict")
+    ui.kv(
+        [
+            ("Tensors", result.n_tensors),
+            ("Layers", result.n_layers),
+            ("Coverage", f"{result.coverage:.1%} (non-other)"),
+            ("Role summary", result.role_summary),
+            ("Quantizable", result.quantizable_summary),
+            ("Probe groups", len(result.group_summary)),
+        ]
+    )
+    ui.section("groups (role@depth)")
+    rows = [f"{gid:28} {n:4} tensors" for gid, n in list(result.group_summary.items())[:20]]
+    if len(result.group_summary) > 20:
+        rows.append(f"… +{len(result.group_summary) - 20} more")
+    ui.bullets(rows)
+    ui.section("sample")
+    ui.bullets(
+        [
+            f"[{'Q' if t.quantizable else '—'}] {t.role:12} {t.depth or '-':7}  {t.name}"
+            for t in result.tensors[:12]
+        ]
+    )
+    if result.other_names:
+        ui.section("unmatched")
+        ui.bullets(result.other_names[:10])
+    ui.next_step("Step 05 — build tensor_catalog.json (HF/GGUF names + groups).")
+
+
+def _explain_catalog(catalog) -> None:
+    ui.section("what happened")
+    ui.bullets(catalog.steps_log)
+    ui.section("verdict")
+    ui.kv(
+        [
+            ("Tensors", catalog.n_tensors),
+            ("Groups", catalog.n_groups),
+            ("Quantizable", catalog.n_quantizable),
+            ("Source", catalog.source_path),
+            ("Backend", catalog.source_backend),
+            ("SHA256", (catalog.source_sha256 or "")[:16] + "…"),
+        ]
+    )
+    ui.next_step("Step 06 — weight features for probe prioritization.")
+
+
+def _fmt_group_hints(items) -> str:
+    out = []
+    for item in (items or [])[:5]:
+        if isinstance(item, dict):
+            out.append(str(item.get("group_id") or item.get("id") or item))
+        else:
+            out.append(str(item))
+    return ", ".join(out) or "-"
+
+
+def _explain_weight_features(result) -> None:
+    ui.section("what happened")
+    ui.bullets(result.steps_log)
+    ui.section("verdict")
+    ui.kv(
+        [
+            ("Tensors featured", f"{result.n_with_features}/{result.n_tensors}"),
+            ("Skipped", result.n_skipped),
+            ("Source quantized?", result.source_is_quantized),
+            ("Hardest groups", _fmt_group_hints(result.hardest_groups)),
+            ("Easiest groups", _fmt_group_hints(result.easiest_groups)),
+        ]
+    )
+    ui.notes(result.notes)
+    ui.next_step("Step 07 — build calibration / held-out corpus.")
+
+
+def _explain_corpus(result) -> None:
+    ui.section("what happened")
+    ui.bullets(result.steps_log)
+    ui.section("verdict")
+    ui.kv(
+        [
+            ("Corpus id", result.corpus_id),
+            ("Docs (calib/search/heldout)", f"{result.n_calib} / {result.n_search} / {result.n_heldout}"),
+            ("Tokens est total", f"{result.tokens_est_total:,}"),
+            ("Chat template", result.chat_template or "-"),
+            ("Domain counts", result.domain_counts),
+        ]
+    )
+    ui.notes(result.notes)
+    ui.next_step("Step 08 — activation features on calib docs.")
+
+
+def _explain_activation_features(result) -> None:
+    ui.section("what happened")
+    ui.bullets(result.steps_log)
+    ui.section("verdict")
+    ui.kv(
+        [
+            ("Method", result.method),
+            ("Docs used", result.n_docs_used),
+            ("Tokens (est)", result.n_tokens_est),
+            ("Tensors", f"{result.n_with_features}/{result.n_tensors}"),
+            ("Hardest groups", _fmt_group_hints(result.hardest_groups)),
+        ]
+    )
+    ui.notes(result.notes)
+    ui.next_step("Step 09 — freeze reference GGUF for imatrix / export.")
+
+
+def _explain_freeze_gguf(result) -> None:
+    ui.section("what happened")
+    ui.bullets(result.steps_log)
+    ui.section("verdict")
+    ui.kv(
+        [
+            ("Method", result.method),
+            ("GGUF path", result.gguf_path),
+            ("Bytes", f"{result.gguf_nbytes:,}"),
+            ("SHA256", (result.gguf_sha256 or "")[:16] + ("…" if result.gguf_sha256 else "")),
+            ("BF16 reference?", result.is_bf16_reference),
+            ("Tensors", result.n_tensors),
+        ]
+    )
+    ui.notes(result.notes)
+    ui.next_step("Step 10 — importance matrix (imatrix).")
+
+
+def _explain_imatrix(result) -> None:
+    ui.section("what happened")
+    ui.bullets(result.steps_log)
+    ui.section("verdict")
+    ui.kv(
+        [
+            ("Method", result.method),
+            ("Imatrix path", result.imatrix_path or result.proxy_path or "-"),
+            ("Tensors scored", result.n_tensors_scored),
+            ("Chunks", result.n_chunks if result.n_chunks is not None else "-"),
+        ]
+    )
+    ui.notes(result.notes)
+    ui.next_step("Step 11 — cache reference logits.")
+
+
+def _explain_reference_logits(result) -> None:
+    ui.section("what happened")
+    ui.bullets(result.steps_log)
+    ui.section("verdict")
+    ui.kv(
+        [
+            ("Method", result.method),
+            ("Cache key", result.cache_key),
+            ("Search logits", result.logits_search_path or "-"),
+            ("Held-out logits", result.logits_heldout_path or "-"),
+        ]
+    )
+    ui.notes(result.notes)
+    ui.next_step("Step 12 — sensitivity probes (ΔKLD / Δbytes).")
+
+
+def _explain_sensitivity(result) -> None:
+    ui.section("what happened")
+    ui.bullets(result.steps_log)
+    ui.section("verdict")
+    ui.kv(
+        [
+            ("Method", result.method),
+            ("Rows", result.n_rows),
+            ("Groups probed", result.n_groups_probed),
+            ("Baseline", result.baseline_type),
+            ("Probe types", ", ".join(result.probe_types) or "-"),
+        ]
+    )
+    ui.notes(result.notes)
+    ui.next_step("Step 13 — optimize mixed-precision recipe.")
+
+
+def _explain_optimize(result) -> None:
+    ui.section("what happened")
+    ui.bullets(result.steps_log)
+    ui.section("verdict")
+    ui.kv(
+        [
+            ("Method", result.method),
+            ("Recipe", result.recipe_path),
+            ("Tensor-type file", result.tensor_type_file),
+            ("Budget bytes", f"{result.budget_bytes:,}"),
+            ("Estimated bytes", f"{result.estimated_bytes:,}"),
+            ("Predicted ΔKLD", f"{result.predicted_delta_kld:.6g}"),
+            ("Groups", result.n_groups),
+        ]
+    )
+    ui.notes(result.notes)
+    ui.next_step("Step 14 — export candidate GGUF.")
+
+
+def _explain_export(result) -> None:
+    ui.section("what happened")
+    ui.bullets(result.steps_log)
+    ui.section("verdict")
+    rows = [
+        ("Method", result.method),
+        ("Output GGUF", result.gguf_out or "(dry-run / missing)"),
+    ]
+    if result.gguf_out_nbytes:
+        rows.append(("Size", f"{result.gguf_out_nbytes / (1024**2):.1f} MiB"))
+    if result.estimated_bytes:
+        rows.append(("Recipe estimate", f"{result.estimated_bytes / (1024**2):.1f} MiB"))
+    rows.append(("Command", " ".join(result.command[:6]) + " …"))
+    ui.kv(rows)
+    ui.notes(result.notes)
+    ui.next_step("Step 15 — validate on held-out; stage release or feedback.")
+
+
+def _explain_validate(result) -> None:
+    ui.section("what happened")
+    ui.bullets(result.steps_log)
+    ui.section("verdict")
+    ui.verdict_badge(result.verdict)
+    ui.kv(
+        [
+            ("Verdict", result.verdict),
+            ("Method", result.method),
+            ("Tier1 pass", result.tier1.get("pass")),
+            ("Tier2 pass", result.tier2.get("pass")),
+            ("Report", result.report_path),
+            ("Release dir", result.release_dir or "-"),
+        ]
+    )
+    if result.report_card_paths:
+        ui.kv(
+            [
+                ("Report card HTML", result.report_card_paths.get("html")),
+                ("Report card MD", result.report_card_paths.get("md")),
+            ]
+        )
+    if result.feedback:
+        ui.section("feedback to optimizer")
+        ui.bullets([f"{f.get('constraint')}: {f.get('action')}" for f in result.feedback])
+    ui.notes(result.notes)
+    nxt = "Steps 01–15 complete (plumbing). Install llama.cpp for real quant/KLD."
+    if result.report_card_paths.get("html"):
+        nxt += f"\nOpen report card: {result.report_card_paths['html']}"
+    ui.next_step(nxt)
 
 
 if __name__ == "__main__":
