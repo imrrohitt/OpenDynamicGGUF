@@ -178,6 +178,34 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_fz.add_argument("--no-explain", action="store_true")
 
+    # --- imatrix (step 10) ---
+    p_im = sub.add_parser(
+        "imatrix",
+        help="Step 10: build importance matrix from calib.txt (llama-imatrix or proxy)",
+    )
+    p_im.add_argument("--model", "-m", default=None)
+    p_im.add_argument("--run", default=None)
+    p_im.add_argument("--force", action="store_true")
+    p_im.add_argument(
+        "--mode",
+        choices=("auto", "llama", "proxy"),
+        default="auto",
+        help="auto: llama-imatrix if found, else proxy scores",
+    )
+    p_im.add_argument(
+        "--llama-imatrix",
+        type=Path,
+        default=None,
+        help="Path to llama-imatrix binary (or set LLAMA_CPP_DIR)",
+    )
+    p_im.add_argument(
+        "--chunks",
+        type=int,
+        default=64,
+        help="llama-imatrix --chunks (default 64; 0 = omit flag)",
+    )
+    p_im.add_argument("--no-explain", action="store_true")
+
     # --- status / runs ---
     p_status = sub.add_parser("status", help="Show checkpoint status for a run")
     p_status.add_argument("--run", default=None, help="run_id (default: latest for --model)")
@@ -205,6 +233,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_activation_features(args)
     if args.command == "freeze-gguf":
         return cmd_freeze_gguf(args)
+    if args.command == "imatrix":
+        return cmd_imatrix(args)
     if args.command == "status":
         return cmd_status(args)
     if args.command == "runs":
@@ -1248,6 +1278,146 @@ def cmd_freeze_gguf(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_imatrix(args: argparse.Namespace) -> int:
+    from odg.imatrix import build_imatrix
+    from odg.store import StepAlreadyDone
+
+    print_explain = not args.no_explain
+    store = _store(args)
+
+    try:
+        meta = _require_run(store, model=args.model, run_id=args.run)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if not store.is_step_done(meta.run_id, "freeze_gguf"):
+        print(
+            "ERROR: Step 09 (freeze-gguf) is not done.\n"
+            f"  Run: odg freeze-gguf --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+    if not store.is_step_done(meta.run_id, "corpus"):
+        print(
+            "ERROR: Step 07 (corpus) is not done.\n"
+            f"  Run: odg corpus --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if print_explain:
+        _banner_imatrix(meta.model_ref, meta.run_id, meta.root)
+
+    if store.is_step_done(meta.run_id, "imatrix") and not args.force:
+        out = store.read_step_output(meta.run_id, "imatrix")
+        if print_explain:
+            print("Step 10 already checkpointed as done — loading from store.")
+            print(f"  path: {store.step_path(meta.run_id, 'imatrix')}")
+            print("  (pass --force to re-run)\n")
+            print(json.dumps(out, indent=2))
+            print("\n" + store.summary(meta.run_id))
+        elif out:
+            print(json.dumps(out, indent=2))
+        return 0
+
+    freeze_out = store.read_step_output(meta.run_id, "freeze_gguf") or {}
+    gguf_path = freeze_out.get("gguf_path")
+    if not gguf_path or not Path(gguf_path).is_file():
+        # fallback: look in step dir
+        step9 = store.step_path(meta.run_id, "freeze_gguf")
+        for name in ("model-bf16.gguf", "model-ref.gguf"):
+            cand = step9 / name
+            if cand.is_file():
+                gguf_path = str(cand)
+                break
+    if not gguf_path:
+        print("ERROR: frozen GGUF path missing from Step 09", file=sys.stderr)
+        return 1
+
+    calib_path = store.step_path(meta.run_id, "corpus") / "calib.txt"
+    if not calib_path.is_file():
+        print(f"ERROR: missing {calib_path}", file=sys.stderr)
+        return 1
+
+    catalog = None
+    for step_id in ("activation_features", "weight_features", "catalog"):
+        cpath = store.step_path(meta.run_id, step_id) / "tensor_catalog.json"
+        if cpath.is_file():
+            catalog = json.loads(cpath.read_text())
+            break
+
+    chunks = int(args.chunks)
+    if chunks <= 0:
+        chunks_arg = None
+    else:
+        chunks_arg = chunks
+
+    input_data = {
+        "from_steps": ["freeze_gguf", "corpus"],
+        "gguf_path": gguf_path,
+        "gguf_sha256": freeze_out.get("gguf_sha256"),
+        "calib_path": str(calib_path),
+        "mode": args.mode,
+        "chunks": chunks_arg,
+    }
+
+    try:
+        step_dir = store.begin_step(
+            meta.run_id, "imatrix", input_data, force=args.force
+        )
+    except StepAlreadyDone:
+        return cmd_imatrix(args)
+
+    try:
+        result = build_imatrix(
+            model_ref=meta.model_ref,
+            out_dir=step_dir,
+            gguf_path=gguf_path,
+            calib_path=calib_path,
+            catalog=catalog,
+            gguf_sha256=freeze_out.get("gguf_sha256"),
+            mode=args.mode,
+            llama_imatrix=args.llama_imatrix,
+            n_chunks=chunks_arg,
+        )
+    except Exception as exc:  # noqa: BLE001
+        store.fail_step(meta.run_id, "imatrix", str(exc))
+        print(f"\nERROR in Step 10 imatrix: {exc}", file=sys.stderr)
+        return 1
+
+    payload = result.summary_dict()
+    log_text = "\n".join(result.steps_log) + "\n"
+
+    store.complete_step(
+        meta.run_id,
+        "imatrix",
+        payload,
+        log_text=log_text,
+        extra_artifacts={
+            "imatrix_manifest.json": json.dumps(payload, indent=2).encode("utf-8")
+            + b"\n",
+        },
+    )
+
+    if print_explain:
+        _explain_imatrix(result)
+        print("\n=== checkpoint saved ===")
+        print(f"  run_id   : {meta.run_id}")
+        print(f"  step dir : {step_dir}")
+        print(
+            "  files    : output.json, imatrix.gguf|proxy, "
+            "imatrix_manifest.json, status.json, log.txt"
+        )
+        print("\n" + store.summary(meta.run_id))
+        print("\n=== imatrix summary (JSON) ===")
+        print(json.dumps(payload, indent=2))
+    else:
+        print(json.dumps(payload, indent=2))
+
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     store = _store(args)
     if args.run:
@@ -1627,6 +1797,54 @@ def _explain_freeze_gguf(result) -> None:
 
     print("\n=== next ===")
     print("  Step 10 — build imatrix from calib.txt + this frozen GGUF.")
+
+
+def _banner_imatrix(model: str, run_id: str, root: str) -> None:
+    print(
+        """
+╔══════════════════════════════════════════════════════════════╗
+║  OpenDynamicGGUF — Step 10: Build imatrix                   ║
+╚══════════════════════════════════════════════════════════════╝
+""".rstrip()
+    )
+    print(
+        f"""
+What this step does
+-------------------
+  Input : frozen GGUF (Step 09) + calib.txt (Step 07) — never heldout
+  Model : {model}
+  Goal  : Activation importance for llama-quantize rounding.
+          Ideal: llama-imatrix → imatrix.gguf
+          Fallback: imatrix_proxy.json from weight/activation features
+
+  Checkpoint
+  ----------
+  run_id : {run_id}
+  root   : {root}
+""".rstrip()
+    )
+
+
+def _explain_imatrix(result) -> None:
+    print("\n=== what happened ===")
+    for line in result.steps_log:
+        print(f"  • {line}")
+
+    print("\n=== verdict ===")
+    print(f"  ✓ Method            : {result.method}")
+    print(f"  ✓ GGUF sha          : {(result.gguf_sha256 or '-')[:24]}…")
+    print(f"  ✓ imatrix.gguf      : {result.imatrix_path or '(not produced)'}")
+    print(f"  ✓ imatrix sha       : {(result.imatrix_sha256 or '-')[:24]}…")
+    print(f"  ✓ proxy json        : {result.proxy_path or '-'}")
+    print(f"  ✓ Tensors scored    : {result.n_tensors_scored}")
+
+    if result.notes:
+        print("\n=== notes ===")
+        for n in result.notes:
+            print(f"  • {n}")
+
+    print("\n=== next ===")
+    print("  Step 11 — cache reference logits on search/heldout splits.")
 
 
 def _banner_classify(model: str, run_id: str, root: str) -> None:

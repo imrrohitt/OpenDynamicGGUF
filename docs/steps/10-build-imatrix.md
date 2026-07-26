@@ -6,68 +6,50 @@
 
 ## Goal
 
-Run `llama-imatrix` on the **calib** split to produce activation-based importance statistics that guide how `llama-quantize` rounds weights inside each tensor.
+Build activation-based importance stats from the **calib** split so quantization can protect important weights when rounding.
+
+Ideal: `llama-imatrix` → `imatrix.gguf` for `llama-quantize --imatrix`.  
+Fallback: `imatrix_proxy.json` from weight/activation features (plumbing only).
 
 ---
 
-## Why it exists
-
-Uniform quantization treats every weight equally. Imatrix says: “these weights matter more under real activations — protect them when rounding.”
-
-```text
-calib.txt → forward pass on BF16 GGUF → collect / average activations → imatrix.gguf
-```
-
-This is complementary to Step 08 (PyTorch activation features for *ranking*). Imatrix is what llama.cpp *consumes* during quantize.
-
----
-
-## Inputs / Outputs
-
-| | |
-|---|---|
-| **Input** | `model-bf16.gguf` + `calib.txt` |
-| **Output** | `imatrix.gguf` (or `.dat` depending on build) |
-
----
-
-## How it works
+## Command
 
 ```bash
-./llama-imatrix \
-  -m model-bf16.gguf \
-  -f calib.txt \
-  -o imatrix.gguf \
-  --chunks 100          # example flag; check your llama.cpp version
+odg imatrix --model functiongemma:latest
+
+# require real binary:
+export LLAMA_CPP_DIR=~/llama.cpp   # must contain build/bin/llama-imatrix
+odg imatrix --model functiongemma:latest --mode llama --force
+
+# proxy only:
+odg imatrix --model functiongemma:latest --mode proxy --force
 ```
 
-What happens inside (conceptually):
-
-1. Load BF16 GGUF  
-2. Feed calibration chunks  
-3. Record activation magnitudes related to each weight tensor  
-4. Average / store importance  
-5. Write file for `--imatrix` in `llama-quantize`
+Requires Steps 07 + 09. **Never** use heldout.txt here.
 
 ---
 
-## Example
+## Outputs
 
 ```text
-calib.txt:   ~900k tokens, chat+code+math, template-rendered
-runtime:     tens of minutes on one GPU / Apple Silicon
-output:      imatrix.gguf (~few MB–tens of MB)
+steps/10_imatrix/
+  imatrix.gguf              # when llama-imatrix succeeds
+  imatrix_proxy.json        # readable per-tensor scores (always in proxy/auto-fallback)
+  imatrix.gguf.MISSING      # marker when proxy-only
+  imatrix_manifest.json
+  output.json
+  status.json
+  log.txt
 ```
-
-**Do not** build imatrix on held-out text. Calib only.
 
 ---
 
 ## Done when
 
-- [ ] `imatrix.gguf` produced from **calib** split only
-- [ ] File hash stored for recipe provenance
-- [ ] Same BF16 GGUF SHA as Step 09
+- [x] Calib-only input recorded (same GGUF SHA as Step 09)
+- [x] `imatrix.gguf` **or** documented `imatrix_proxy.json` produced
+- [x] Hashes / paths stored in manifest
 
 ## Next
 
