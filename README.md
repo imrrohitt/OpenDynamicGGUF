@@ -33,19 +33,20 @@ output                -> Q8_0     (pinned)
 2. [Design principles](#2-design-principles)
 3. [System architecture](#3-system-architecture)
 4. [Stage 1 — Universal model resolver](#4-stage-1--universal-model-resolver)
-5. [Stage 2 — Ingest & freeze reference](#5-stage-2--ingest--freeze-reference)
-6. [Stage 3 — Calibration corpus & the three-way split](#6-stage-3--calibration-corpus--the-three-way-split)
-7. [Stage 4 — Reference artifacts (compute once)](#7-stage-4--reference-artifacts-compute-once)
-8. [Stage 5 — Sensitivity probing](#8-stage-5--sensitivity-probing)
-9. [Stage 6 — Recipe optimizer](#9-stage-6--recipe-optimizer)
-10. [Stage 7 — Reproducible export](#10-stage-7--reproducible-export)
-11. [Stage 8 — Validation gates](#11-stage-8--validation-gates)
-12. [One pipeline, every architecture](#12-one-pipeline-every-architecture)
-13. [Recipe format](#13-recipe-format)
-14. [Repository layout](#14-repository-layout)
-15. [Roadmap / build order](#15-roadmap--build-order)
-16. [Cost & hardware expectations](#16-cost--hardware-expectations)
-17. [Related work & references](#17-related-work--references)
+5. [Stage 2 — Load, classify, catalog, features](#5-stage-2--load-classify-catalog-features)
+6. [Stage 3 — Ingest & freeze GGUF reference](#6-stage-3--ingest--freeze-gguf-reference)
+7. [Stage 4 — Calibration corpus & the three-way split](#7-stage-4--calibration-corpus--the-three-way-split)
+8. [Stage 5 — Reference artifacts (compute once)](#8-stage-5--reference-artifacts-compute-once)
+9. [Stage 6 — Sensitivity probing](#9-stage-6--sensitivity-probing)
+10. [Stage 7 — Recipe optimizer](#10-stage-7--recipe-optimizer)
+11. [Stage 8 — Reproducible export](#11-stage-8--reproducible-export)
+12. [Stage 9 — Validation gates](#12-stage-9--validation-gates)
+13. [One pipeline, every architecture](#13-one-pipeline-every-architecture)
+14. [Recipe format](#14-recipe-format)
+15. [Repository layout](#15-repository-layout)
+16. [Roadmap / build order](#16-roadmap--build-order)
+17. [Cost & hardware expectations](#17-cost--hardware-expectations)
+18. [Related work & references](#18-related-work--references)
 
 ---
 
@@ -84,27 +85,61 @@ OpenDynamicGGUF is the **measurement, search, and validation loop around these t
 
 ## 3. System architecture
 
-```mermaid
-flowchart TD
-    A["Any model reference\nOllama tag / HF repo / MLX repo / local dir"] --> R["1 · Universal resolver\ntrace to full-precision source"]
-    R --> B["2 · Ingest & freeze\nconvert_hf_to_gguf → BF16 GGUF + SHA-256"]
-    C["3 · Calibration corpus\nchat / code / math / multilingual / domain\nrendered with the model's chat template"] --> D["Three-way split"]
-    D -->|"calib (60%)"| E["4 · imatrix\nllama-imatrix"]
-    D -->|"search (20%)"| G
-    D -->|"held-out (20%)\nnever seen by search"| K
-    B --> E
-    B --> F["4 · BF16 logit cache\nllama-perplexity --kl-divergence-base"]
-    E --> G["5 · Sensitivity prober\nfeatures → rank → trial quant → ΔKLD/Δbytes"]
-    F --> G
-    G --> H["6 · Recipe optimizer\nmax bytes saved / ΔKLD under budget"]
-    H --> I["7 · Exporter\nrecipe.yaml → llama-quantize --tensor-type-file"]
-    I --> J["Candidate GGUFs\n(Pareto set: size ↔ quality)"]
-    J --> K["8 · Validation gates\nTier 1 KLD · Tier 2 smoke · Tier 3 benchmarks"]
-    K -->|"gate fails → constraint\n(e.g. pin group one level higher)"| H
-    K -->|"all gates pass"| L["Release\nGGUF + recipe.yaml + report"]
+```text
+User model ref (Ollama / MLX / HF / local)
+        │
+        ▼
+1 · Resolve to original BF16 safetensors
+        │
+        ▼
+2 · Load model → enumerate state_dict → classify roles → tensor catalog → features
+        │
+        ▼
+3 · Freeze BF16 GGUF (+ SHA-256)     ← llama.cpp execution path
+        │
+        ▼
+4 · Calibration corpus (3-way split)
+        │
+        ▼
+5 · Reference artifacts (imatrix + BF16 logits)
+        │
+        ▼
+6 · Sensitivity: features rank → trial quant → measure ΔKLD
+        │
+        ▼
+7 · Optimizer (bytes_saved / ΔKLD under budget)
+        │
+        ▼
+8 · Export GGUF from recipe
+        │
+        ▼
+9 · Validation gates → release
 ```
 
-The dataflow in one paragraph: the resolver normalizes any model reference to full-precision weights; ingestion freezes a hashed BF16 GGUF that everything else derives from; the corpus manager builds chat-template-rendered calibration text and splits it three ways; the two expensive full-precision artifacts (imatrix, reference logits) are computed once and cached; the prober measures how much quality each tensor group loses per byte saved; the optimizer solves the resulting knapsack under the user's budget and emits a Pareto set of recipes; the exporter renders recipes into `llama-quantize` overrides; and the validation harness gates every candidate on data the search never saw, feeding failures back as constraints.
+```mermaid
+flowchart TD
+    A["Any model reference"] --> R["1 · Resolver\n→ original BF16 HF"]
+    R --> L["2 · Load + enumerate\nclassify + catalog + features"]
+    R --> B["3 · Freeze BF16 GGUF\n+ SHA-256"]
+    L --> CAT["tensor_catalog.json"]
+    C["4 · Calibration corpus"] --> D["Three-way split"]
+    D -->|"calib"| E["5 · imatrix"]
+    D -->|"search"| G
+    D -->|"held-out"| K
+    B --> E
+    B --> F["5 · BF16 logit cache"]
+    CAT --> G["6 · Sensitivity prober\nrank → probe → ΔKLD/Δbytes"]
+    E --> G
+    F --> G
+    G --> H["7 · Optimizer"]
+    H --> I["8 · Export GGUF"]
+    I --> J["Candidate GGUFs"]
+    J --> K["9 · Validation gates"]
+    K -->|"fail → constraint"| H
+    K -->|"pass"| REL["Release"]
+```
+
+**Two views of the same weights:** Stage 2 loads the HF checkpoint in PyTorch to *inspect* every tensor (catalog + features). Stage 3 converts the same checkpoint to a frozen BF16 GGUF so *probes and export* run through llama.cpp. Both must share the same source SHA / content hash.
 
 ## 4. Stage 1 — Universal model resolver
 
@@ -121,22 +156,168 @@ The generalization that makes this work for *any* model: the pipeline never star
 **Produces:** BF16 safetensors + an *architecture descriptor* (family, layer count, MoE/SSM flags, chat template, specialty domain).
 **Failure prevented:** requantizing already-quantized weights (MLX 4-bit, Ollama Q4). Quantization error compounds — no downstream search can recover it.
 
-The architecture descriptor drives two later decisions: which tensor-group taxonomy to use (§12) and which domain data/checks to add (e.g. function-calling traces and JSON-validity gates for a `functiongemma`-style fine-tune).
+The architecture descriptor drives two later decisions: which tensor-role taxonomy to use (§13) and which domain data/checks to add (e.g. function-calling traces and JSON-validity gates for a `functiongemma`-style fine-tune).
 
-## 5. Stage 2 — Ingest & freeze reference
+## 5. Stage 2 — Load, classify, catalog, features
+
+This is the **first analysis stage**. No quantization decisions happen here. The goal is to know every tensor in the model, what role it plays, and what its weight/activation features look like — so Stage 6 can prioritize probes intelligently.
+
+### 2a. Load the original BF16 model
+
+```python
+from transformers import AutoModelForCausalLM
+import torch
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_PATH,                 # path from the resolver — never an MLX/Ollama quant
+    torch_dtype=torch.bfloat16,
+)
+```
+
+The complete network is now in memory as full-precision weights.
+
+### 2b. Enumerate every tensor
+
+PyTorch exposes parameters (and registered buffers) via `state_dict()`:
+
+```python
+state = model.state_dict()
+
+for name, tensor in state.items():
+    print(name, tuple(tensor.shape), tensor.dtype)
+```
+
+Example names (Gemma / Llama-style):
+
+```text
+model.embed_tokens.weight
+model.layers.0.self_attn.q_proj.weight
+model.layers.0.self_attn.k_proj.weight
+model.layers.0.self_attn.v_proj.weight
+model.layers.0.self_attn.o_proj.weight
+model.layers.0.mlp.gate_proj.weight
+model.layers.0.mlp.up_proj.weight
+model.layers.0.mlp.down_proj.weight
+model.layers.0.input_layernorm.weight
+model.norm.weight
+lm_head.weight
+```
+
+Each line is **one tensor**. MoE / hybrid models add expert and SSM names; the catalog records whatever is present.
+
+### 2c. Tensor classification (role taxonomy)
+
+Before computing features, classify each name into a **role**. This is more informative than treating all tensors identically — the optimizer (and humans) already know that attention-V is usually more sensitive than MLP-up.
+
+| Role | Typical HF name patterns | Usually quantizable? |
+|---|---|---|
+| `embedding` | `embed_tokens`, `tok_embeddings` | Yes (often pinned high) |
+| `attn_q` | `q_proj`, `wq` | Yes |
+| `attn_k` | `k_proj`, `wk` | Yes |
+| `attn_v` | `v_proj`, `wv` | Yes (often high sensitivity) |
+| `attn_o` | `o_proj`, `wo` | Yes |
+| `ffn_gate` | `gate_proj`, `w1` | Yes (often cheap bits) |
+| `ffn_up` | `up_proj`, `w3` | Yes (often cheap bits) |
+| `ffn_down` | `down_proj`, `w2` | Yes (medium) |
+| `ffn_*_exps` | `*.experts.*` (MoE) | Yes |
+| `router` | `gate`, `router` (MoE) | Pin / careful |
+| `ssm_*` | hybrid / Mamba paths | Role-dependent |
+| `norm` | `layernorm`, `rms_norm`, `norm` | Usually **skip** (leave F16/F32) |
+| `lm_head` | `lm_head`, `output` | Yes (often pinned high) |
+
+Also record **layer index** (and depth bucket: early / middle / late) when the name contains one. Role × depth is the grouping key used later (~25 groups instead of hundreds of tensors).
+
+### 2d. Build the tensor catalog
+
+For every tensor, store metadata:
+
+```text
+name:     model.layers.12.self_attn.q_proj.weight
+shape:    [640, 640]
+dtype:    bfloat16
+role:     attn_q
+layer:    12
+depth:    middle
+nbytes:   …
+gguf_name: blk.12.attn_q.weight   # mapped when known; used at export
+quantizable: true
+```
+
+At this point you know **every tensor in the model** and how it maps into GGUF naming for `llama-quantize --tensor-type`.
+
+### 2e. Compute tensor features
+
+Iterate the catalog. Weight-side features are computed directly from the tensor; activation-side features need a short forward pass on the **calib** split (Stage 4) and can be filled in after the corpus exists — or computed here if calib text is already available.
+
+```text
+Per tensor (or per group aggregate):
+  mean, variance, entropy
+  sparsity, outlier_ratio
+  weight_norm, spectral_norm (approx OK for large mats)
+  activation_range / activation stats  ← from calib forward pass
+```
+
+Example:
+
+```text
+model.layers.12.self_attn.q_proj.weight
+  mean=0.001  variance=0.05  entropy=6.8
+  sparsity=0.72  outlier_ratio=0.002
+  weight_norm=13.8  spectral_norm=2.9
+```
+
+These features feed **sensitivity prediction / ranking only**. They do not accept or reject a bit-width by themselves (see Stage 6).
+
+### 2f. Persist the catalog
+
+Write a content-addressed artifact (JSON or SQLite), e.g. `tensor_catalog.json`:
+
+```json
+{
+  "model_source": "google/gemma-3-270m",
+  "source_sha256": "…",
+  "tensors": {
+    "model.layers.12.self_attn.q_proj.weight": {
+      "shape": [640, 640],
+      "role": "attn_q",
+      "layer": 12,
+      "depth": "middle",
+      "gguf_name": "blk.12.attn_q.weight",
+      "quantizable": true,
+      "features": {
+        "mean": 0.001,
+        "variance": 0.05,
+        "entropy": 6.8,
+        "sparsity": 0.72,
+        "outlier_ratio": 0.002,
+        "weight_norm": 13.8,
+        "spectral_norm": 2.9
+      }
+    }
+  }
+}
+```
+
+**Consumes:** resolved BF16 HF path + architecture descriptor.  
+**Produces:** `tensor_catalog.json` (names, roles, shapes, features, GGUF name map).  
+**Failure prevented:** probing “blind” without knowing which tensors exist, which roles they play, or which names to pass to `--tensor-type`.
+
+## 6. Stage 3 — Ingest & freeze GGUF reference
+
+Same resolved checkpoint, second representation — for the llama.cpp path:
 
 ```bash
 python llama.cpp/convert_hf_to_gguf.py ./model-src --outtype bf16 --outfile model-bf16.gguf
 sha256sum model-bf16.gguf   # recorded in every downstream artifact
 ```
 
-**Consumes:** BF16 safetensors + architecture descriptor.
-**Produces:** `model-bf16.gguf` (the frozen reference) + its SHA-256.
+**Consumes:** BF16 safetensors + architecture descriptor.  
+**Produces:** `model-bf16.gguf` (frozen reference) + SHA-256.  
 **Failure prevented:** sensitivity measured on one build while export runs on another — results become silently incomparable and the recipe stops being reproducible.
 
-Sensitivity probing, export, and validation all derive from these exact bytes.
+Probing, export, and validation all derive from these exact GGUF bytes. The catalog from Stage 2 must point at the same source.
 
-## 6. Stage 3 — Calibration corpus & the three-way split
+## 7. Stage 4 — Calibration corpus & the three-way split
 
 The corpus is the text the quantization is optimized against. It must look like the model's real workload:
 
@@ -154,7 +335,7 @@ Then it is split three ways, with a hard wall between splits:
 
 **Failure prevented:** calibrating and evaluating on the same distribution. Most frameworks calibrate on Wikipedia-style text and then report KLD/perplexity on Wikipedia-style text — so the quants look better than they are. Splitting search data from judging data is the fix, and it is cheap.
 
-## 7. Stage 4 — Reference artifacts (compute once)
+## 8. Stage 5 — Reference artifacts (compute once)
 
 Two expensive full-precision artifacts are computed exactly once and cached for every candidate that follows:
 
@@ -169,9 +350,9 @@ Two expensive full-precision artifacts are computed exactly once and cached for 
 
 **Failure prevented:** re-running the full-precision forward pass per candidate — the cost that makes naive search infeasible on a single workstation.
 
-## 8. Stage 5 — Sensitivity probing
+## 9. Stage 6 — Sensitivity probing
 
-This is the heart of OpenDynamicGGUF. The search space is tamed by grouping tensors, **prioritized** with cheap statistics, then **decided** only by measured model behavior.
+This is the heart of OpenDynamicGGUF. It starts from the **tensor catalog** (Stage 2): groups already classified by role × depth, features already computed. Those features **prioritize** which groups and bit-widths to trial first; probes **decide**.
 
 ### Why statistics alone are not enough
 
@@ -195,30 +376,23 @@ Features say *"probably easy"* or *"probably hard"*. The probe says *"how much q
 
 ### Grouping
 
-Tensors are grouped by **role × depth bucket**:
-
-- Roles: `attn_q`, `attn_k`, `attn_v`, `attn_output`, `ffn_gate`, `ffn_up`, `ffn_down` (plus `_exps` variants for MoE, `ssm_*` for hybrids), `token_embd`, `output`.
-- Depth buckets: early / middle / late layers.
-
-That's **~25 groups instead of ~300 tensors** — tractable, and each group is human-meaningful.
+Grouping is already done in the catalog (Stage 2c): **role × depth bucket**. Norms and other non-quantizable entries are skipped. That yields **~25 probe groups** instead of hundreds of individual tensors.
 
 ### Probe pipeline (per group)
 
 ```
-Tensor group
+Tensor catalog (roles + features already stored)
       │
       ▼
-Extract features          ← cheap heuristics (prioritization only)
-      │
-      ▼
-Estimate sensitivity score   e.g. weighted combo of variance, outliers,
-                             spectral norm, activation range, entropy
+Estimate sensitivity score   from catalog features
+                             (variance, outliers, spectral norm, …)
       │
       ▼
 Rank groups + choose trial bit-widths   (Q2 / Q3 / Q4 / Q5 / Q6…)
       │
       ▼
 Trial quantization          only this group; rest stays BF16
+                            (regex / --tensor-type from gguf_name map)
       │
       ▼
 Run search-split prompts    BF16 logits (cached) vs probe logits
@@ -266,7 +440,7 @@ If the Q3 probe returns ΔKLD ≈ 0.003 → keep Q3. If it returns ΔKLD ≈ 0.1
 
 **Failure prevented:** (1) blind search over an enormous per-tensor space, (2) false confidence from statistic thresholds that miss high-sensitivity layers with "easy-looking" distributions. Every final bit assignment traces back to a measured ΔKLD.
 
-## 9. Stage 6 — Recipe optimizer
+## 10. Stage 7 — Recipe optimizer
 
 Bit assignment under a byte budget is (approximately) a **knapsack problem**:
 
@@ -278,7 +452,7 @@ v1 deliberately skips Bayesian optimization and evolutionary search: each object
 
 **Failure prevented:** a single opaque config. Emitting the whole frontier lets the user pick the trade-off and keeps every choice auditable.
 
-## 10. Stage 7 — Reproducible export
+## 11. Stage 8 — Reproducible export
 
 A recipe is rendered into a `--tensor-type-file` and executed:
 
@@ -292,7 +466,7 @@ The recipe carries the **model hash, imatrix hash, and every group assignment**,
 
 **Failure prevented:** "trust me" quants. Full reproducibility is this project's differentiator against closed dynamic-quant pipelines.
 
-## 11. Stage 8 — Validation gates
+## 12. Stage 9 — Validation gates
 
 Three cost-ordered tiers, **all on data the search never saw**. A candidate ships only after passing every gate.
 
@@ -326,7 +500,7 @@ A gate failure returns to the optimizer as a **concrete constraint**, not a blin
 
 **Failure prevented:** shipping a quant that only looks good on its own calibration data — the exact overfitting failure this whole design exists to avoid.
 
-## 12. One pipeline, every architecture
+## 13. One pipeline, every architecture
 
 The probe-and-search loop is identical for every model; only the **tensor taxonomy and default policies** adapt. The architecture descriptor from the resolver selects the profile.
 
@@ -374,7 +548,7 @@ A fine-tune keeps the base architecture, so the taxonomy and the base model's re
 - **Re-probe:** fine-tuning shifts weight outliers, so sensitivity is re-measured (cheap, thanks to the cache).
 - **Extra gate:** Tier 2 adds domain smoke tests — every emitted tool call must be schema-valid JSON before the quant can ship.
 
-## 13. Recipe format
+## 14. Recipe format
 
 The unit of reproducibility. Sketch:
 
@@ -405,17 +579,18 @@ validation:
 
 `odg build recipe.yaml` reproduces the GGUF bit-for-bit from the same inputs.
 
-## 14. Repository layout
+## 15. Repository layout
 
 ```
 opendynamicgguf/
 ├── odg/
-│   ├── resolve.py       # any ref (Ollama / HF / MLX / local) → BF16 safetensors + descriptor
+│   ├── resolve.py       # any ref → original BF16 HF + architecture descriptor
+│   ├── catalog.py       # load model, state_dict enumerate, role classify, catalog JSON
+│   ├── features.py      # weight + activation stats — ranking only
 │   ├── ingest.py        # convert_hf_to_gguf → hashed BF16 GGUF
 │   ├── corpus.py        # corpus build, chat-template render, 3-way split
 │   ├── runners.py       # llama-imatrix / llama-quantize / llama-perplexity wrappers
-│   ├── features.py      # per-group stats (mean/var/sparsity/outliers/norms…) — ranking only
-│   ├── sensitivity.py   # features → rank → trial quant → ΔKLD/Δbytes table
+│   ├── sensitivity.py   # catalog features → rank → trial quant → ΔKLD/Δbytes
 │   ├── optimizer.py     # maximize bytes_saved/ΔKLD under budget → Pareto set
 │   ├── recipe.py        # recipe.yaml ↔ --tensor-type-file rendering
 │   ├── validate/
@@ -423,40 +598,41 @@ opendynamicgguf/
 │   │   ├── tier2_smoke.py
 │   │   ├── tier3_bench.py
 │   │   └── gates.py
-│   ├── cache.py         # content-addressed artifacts (config hash → GGUF/logits/KLD)
+│   ├── cache.py         # content-addressed artifacts
 │   └── cli.py           # odg quantize --model … --target-size …
-├── recipes/             # published, reproducible recipes per model
-└── reports/             # per-run reports: metrics, gates, Pareto frontier
+├── recipes/
+└── reports/
 ```
 
-`cache.py` matters more than it looks: every artifact (GGUF, imatrix, logits, KLD result) is keyed by a hash of its full input configuration, so re-runs reuse everything unchanged and the ~25-group probe never re-measures what it already knows.
+`cache.py` keys every artifact (catalog, GGUF, imatrix, logits, KLD) by the hash of its full input config, so re-runs reuse everything unchanged.
 
-## 15. Roadmap / build order
+## 16. Roadmap / build order
 
 Three shippable milestones — each independently useful before the next exists:
 
-- **M1 — Runners + Tier-1 harness.** Subprocess wrappers for the llama.cpp tools plus the KLD gate. Useful standalone: audit any existing community GGUF and publish honest fidelity tables (mean/tail KLD, top-token agreement).
-- **M2 — Features + sensitivity prober.** Cheap per-group feature extraction for ranking, then full trial-quantize probes that publish ΔKLD/Δbytes tables. The tables alone are novel, citable output; the features only accelerate which probes to run first.
-- **M3 — Optimizer + full gate loop.** First end-to-end `odg quantize` producing a GGUF, a recipe, and a report.
+- **M1 — Resolver + catalog + runners + Tier-1 harness.** Resolve any ref to BF16, load/`state_dict` catalog with role classification, llama.cpp wrappers, and the KLD gate. Useful standalone: inspect any model’s tensor map and audit existing GGUFs.
+- **M2 — Features + sensitivity prober.** Fill catalog features, rank groups, run trial-quantize probes, publish ΔKLD/Δbytes tables.
+- **M3 — Optimizer + full gate loop.** End-to-end `odg quantize` → GGUF + recipe + report.
 
 Later experiments (explicitly *not* v1): smarter search (Bayesian/evolutionary), per-expert bit allocation from usage counts, KV-cache quantization sensitivity, attention-head/neuron-level importance, LLM-in-the-loop failure analysis suggesting recipe changes.
 
-## 16. Cost & hardware expectations
+## 17. Cost & hardware expectations
 
 For a 2–8B model on a single decent workstation (e.g. 24 GB GPU or Apple Silicon with 32 GB+):
 
 | Step | Rough cost |
 |---|---|
-| Convert + hash | minutes |
+| Resolve + load + catalog + weight features | minutes |
+| Convert BF16 GGUF + hash | minutes |
 | imatrix + reference logits | tens of minutes (one-time per model/corpus) |
 | One probe (quantize + Tier-1 eval) | ~5–15 minutes |
 | Full ~25-group probe sweep | overnight, embarrassingly parallel |
 | Greedy + refinement (~10 joint evals) | a few hours |
 | Tier 3 benchmarks (final candidates) | hours |
 
-Nothing here needs a cluster. For 70B+ or big MoE models, the same pipeline applies — the probe sweep just wants a bigger box or more patience.
+Nothing here needs a cluster. For 70B+ or big MoE models, the same pipeline applies — the probe sweep just wants a bigger box or more patience. Catalog construction may need CPU/disk offload or sharding for very large models.
 
-## 17. Related work & references
+## 18. Related work & references
 
 Study these before/while building — the design above borrows deliberately from what's publicly known:
 
