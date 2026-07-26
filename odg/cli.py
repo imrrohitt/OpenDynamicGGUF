@@ -112,6 +112,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_wf.add_argument("--no-explain", action="store_true")
 
+    # --- corpus (step 07) ---
+    p_corp = sub.add_parser(
+        "corpus",
+        help="Step 07: build calib/search/heldout text corpus (3-way split)",
+    )
+    p_corp.add_argument("--model", "-m", default=None)
+    p_corp.add_argument("--run", default=None)
+    p_corp.add_argument("--force", action="store_true")
+    p_corp.add_argument(
+        "--target-tokens",
+        type=int,
+        default=50_000,
+        help="Approximate token budget (chars/4). Default 50000; use 300000+ for production",
+    )
+    p_corp.add_argument("--seed", type=int, default=42)
+    p_corp.add_argument("--no-explain", action="store_true")
+
     # --- status / runs ---
     p_status = sub.add_parser("status", help="Show checkpoint status for a run")
     p_status.add_argument("--run", default=None, help="run_id (default: latest for --model)")
@@ -133,6 +150,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_catalog(args)
     if args.command == "weight-features":
         return cmd_weight_features(args)
+    if args.command == "corpus":
+        return cmd_corpus(args)
     if args.command == "status":
         return cmd_status(args)
     if args.command == "runs":
@@ -782,6 +801,111 @@ def cmd_weight_features(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_corpus(args: argparse.Namespace) -> int:
+    from odg.corpus import build_corpus
+    from odg.store import StepAlreadyDone
+
+    print_explain = not args.no_explain
+    store = _store(args)
+
+    try:
+        meta = _require_run(store, model=args.model, run_id=args.run)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    # Corpus needs resolve descriptor; weight_features is the logical prior step
+    if not store.is_step_done(meta.run_id, "weight_features"):
+        print(
+            "ERROR: Step 06 (weight-features) is not done.\n"
+            f"  Run: odg weight-features --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if print_explain:
+        _banner_corpus(meta.model_ref, meta.run_id, meta.root)
+
+    if store.is_step_done(meta.run_id, "corpus") and not args.force:
+        out = store.read_step_output(meta.run_id, "corpus")
+        if print_explain:
+            print("Step 07 already checkpointed as done — loading from store.")
+            print(f"  path: {store.step_path(meta.run_id, 'corpus')}")
+            print("  (pass --force to re-run)\n")
+            print(json.dumps(out, indent=2))
+            print("\n" + store.summary(meta.run_id))
+        elif out:
+            print(json.dumps(out, indent=2))
+        return 0
+
+    resolve_out = store.read_step_output(meta.run_id, "resolve") or {}
+    desc = resolve_out.get("descriptor") or {}
+    chat_template = desc.get("chat_template") or "gemma3"
+    specialty = desc.get("specialty_domain")
+
+    input_data = {
+        "from_step": "weight_features",
+        "chat_template": chat_template,
+        "specialty_domain": specialty,
+        "target_tokens": int(args.target_tokens),
+        "seed": int(args.seed),
+        "splits": {"calib": 0.6, "search": 0.2, "heldout": 0.2},
+    }
+
+    try:
+        step_dir = store.begin_step(
+            meta.run_id, "corpus", input_data, force=args.force
+        )
+    except StepAlreadyDone:
+        return cmd_corpus(args)
+
+    try:
+        result, manifest = build_corpus(
+            model_ref=meta.model_ref,
+            out_dir=step_dir,
+            chat_template=chat_template,
+            specialty_domain=specialty,
+            target_tokens=int(args.target_tokens),
+            seed=int(args.seed),
+        )
+    except Exception as exc:  # noqa: BLE001
+        store.fail_step(meta.run_id, "corpus", str(exc))
+        print(f"\nERROR in Step 07 corpus: {exc}", file=sys.stderr)
+        return 1
+
+    payload = result.summary_dict()
+    log_text = "\n".join(result.steps_log) + "\n"
+
+    # Files already written into step_dir by build_corpus; also store manifest
+    store.complete_step(
+        meta.run_id,
+        "corpus",
+        payload,
+        log_text=log_text,
+        extra_artifacts={
+            "corpus_manifest.json": json.dumps(manifest, indent=2).encode("utf-8")
+            + b"\n",
+        },
+    )
+
+    if print_explain:
+        _explain_corpus(result)
+        print("\n=== checkpoint saved ===")
+        print(f"  run_id   : {meta.run_id}")
+        print(f"  step dir : {step_dir}")
+        print(
+            "  files    : output.json, calib.txt, search.txt, heldout.txt, "
+            "corpus_manifest.json, status.json, log.txt"
+        )
+        print("\n" + store.summary(meta.run_id))
+        print("\n=== corpus summary (JSON) ===")
+        print(json.dumps(payload, indent=2))
+    else:
+        print(json.dumps(payload, indent=2))
+
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     store = _store(args)
     if args.run:
@@ -991,6 +1115,67 @@ def _explain_weight_features(result) -> None:
 
     print("\n=== next ===")
     print("  Step 07 — build calibration corpus (calib / search / held-out).")
+
+
+def _banner_corpus(model: str, run_id: str, root: str) -> None:
+    print(
+        """
+╔══════════════════════════════════════════════════════════════╗
+║  OpenDynamicGGUF — Step 07: Calibration corpus              ║
+╚══════════════════════════════════════════════════════════════╝
+""".rstrip()
+    )
+    print(
+        f"""
+What this step does
+-------------------
+  Input : Resolve descriptor (chat_template, specialty_domain)
+  Model : {model}
+  Goal  : Mixed-domain prompts → chat template → 60/20/20 split
+          calib.txt / search.txt / heldout.txt
+
+  Hard rule: heldout is for validation ONLY (never for search).
+
+  Checkpoint
+  ----------
+  run_id : {run_id}
+  root   : {root}
+""".rstrip()
+    )
+
+
+def _explain_corpus(result) -> None:
+    print("\n=== what happened ===")
+    for line in result.steps_log:
+        print(f"  • {line}")
+
+    print("\n=== verdict ===")
+    print(f"  ✓ Documents          : {result.n_documents}")
+    print(
+        f"  ✓ Split              : calib={result.n_calib} "
+        f"search={result.n_search} heldout={result.n_heldout}"
+    )
+    print(
+        f"  ✓ Tokens (est)       : total={result.tokens_est_total} "
+        f"calib={result.tokens_est_calib} "
+        f"search={result.tokens_est_search} "
+        f"heldout={result.tokens_est_heldout}"
+    )
+    print(f"  ✓ Template           : {result.chat_template}")
+    print(f"  ✓ Specialty          : {result.specialty_domain}")
+    print(f"  ✓ Domains            : {result.domain_counts}")
+
+    print("\n=== files ===")
+    for k, p in result.files.items():
+        print(f"  {k:<8} {p}")
+
+    if result.notes:
+        print("\n=== notes ===")
+        for n in result.notes:
+            print(f"  • {n}")
+
+    print("\n=== next ===")
+    print("  Step 08 — activation features (needs calib.txt + a forward pass).")
 
 
 def _banner_classify(model: str, run_id: str, root: str) -> None:

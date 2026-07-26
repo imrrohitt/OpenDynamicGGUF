@@ -49,7 +49,7 @@ Each step file answers the same questions:
 | 04 | Classify tensors | [04-classify-tensors.md](./04-classify-tensors.md) | Map each name → role / depth / quantizable |
 | 05 | Build catalog | [05-build-tensor-catalog.md](./05-build-tensor-catalog.md) | `tensor_catalog.json` source of truth |
 | 06 | Weight features | [06-compute-weight-features.md](./06-compute-weight-features.md) | `odg weight-features` — mean/var/norms + hardness |
-| 07 | Calibration corpus | [07-build-calibration-corpus.md](./07-build-calibration-corpus.md) | Mixed text + 3-way split |
+| 07 | Calibration corpus | [07-build-calibration-corpus.md](./07-build-calibration-corpus.md) | `odg corpus` — calib/search/heldout 60/20/20 |
 | 08 | Activation features | [08-compute-activation-features.md](./08-compute-activation-features.md) | Run text → hidden-state stats |
 | 09 | Freeze BF16 GGUF | [09-freeze-bf16-gguf.md](./09-freeze-bf16-gguf.md) | HF → hashed BF16 GGUF for llama.cpp |
 | 10 | Build imatrix | [10-build-imatrix.md](./10-build-imatrix.md) | Activation importance for rounding |
