@@ -58,7 +58,7 @@ odg resolve --model functiongemma:latest --new-run
 ## How later steps should use it
 
 ```python
-from odg.store import RunStore, StepAlreadyDone
+from store import RunStore, StepAlreadyDone
 
 store = RunStore()  # ./artifacts
 meta = store.get_or_create_run("functiongemma:latest")
@@ -79,4 +79,4 @@ store.complete_step(meta.run_id, "catalog", output_data={...}, log_text="...")
 
 Without a store, a crash at Step 12 means re-doing catalog, corpus, imatrix, and probes. With checkpoints, Step 12 resumes from saved sensitivity partials / previous done steps.
 
-Code: `odg/store.py`, `odg/steps.py`.
+Code: `store.py`, `steps.py`.

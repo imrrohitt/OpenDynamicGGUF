@@ -831,30 +831,36 @@ validation:
 
 ## Repository layout
 
+Flat modules at the repo root (CLI command is still `odg`):
+
 ```text
 OpenDynamicGGUF/
-├── odg/
-│   ├── cli.py                  # odg <command> entry point
-│   ├── store.py                # filesystem run store: checkpoints, resume, status
-│   ├── steps.py                # step registry / ordering
-│   ├── gguf_tensors.py         # GGUF tensor-name helpers
-│   ├── resolve/                # 01 · any ref → original BF16 + architecture descriptor
-│   ├── load/                   # 02 · open GGUF/HF checkpoint, build tensor index
-│   ├── enumerate/              # 03 · flat inventory: name / shape / dtype / nbytes
-│   ├── classify/               # 04 · role / depth / quantizable per tensor
-│   ├── catalog/                # 05 · tensor_catalog.json — source of truth
-│   ├── weight_features/        # 06 · mean / var / sparsity / outliers / norms
-│   ├── corpus/                 # 07 · mixed calibration text + 3-way split
-│   └── activation_features/    # 08 · activation range / outliers (forward or proxy)
-├── docs/
-│   ├── assets/                 # logo and diagrams
-│   └── steps/                  # one design doc per pipeline step (00–15)
-├── artifacts/                  # run store output (git-ignored)
+├── cli.py                  # odg <command> entry point
+├── ui.py                   # colorful terminal UI
+├── store.py                # filesystem run store: checkpoints, resume, status
+├── steps.py                # step registry / ordering
+├── gguf_tensors.py         # GGUF tensor payload helpers
+├── llama_bins.py           # find llama.cpp binaries
+├── resolve.py              # 01 · model ref → local path + descriptor
+├── load.py                 # 02 · open GGUF/HF, tensor index
+├── enumerate.py            # 03 · flat tensor inventory
+├── classify.py             # 04 · role / depth / quantizable
+├── catalog.py              # 05 · tensor_catalog.json
+├── weight_features.py      # 06 · weight stats
+├── corpus.py               # 07 · calib / search / held-out split
+├── activation_features.py  # 08 · activation stats (forward or proxy)
+├── freeze.py               # 09 · freeze reference GGUF
+├── imatrix.py              # 10 · importance matrix
+├── logits.py               # 11 · reference logits cache
+├── sensitivity.py          # 12 · ΔKLD / Δbytes probes
+├── optimizer.py            # 13 · mixed-precision recipe
+├── export.py               # 14 · export candidate GGUF
+├── validate.py             # 15 · gates + report card
+├── docs/steps/             # design docs (00–15)
+├── artifacts/              # run store (git-ignored)
 ├── LICENSE
 └── pyproject.toml
 ```
-
-Planned modules, one per remaining step: `ingest/` (09), `imatrix/` (10), `logits/` (11), `sensitivity/` (12), `optimizer/` (13), `export/` (14), `validate/` (15).
 
 Every artifact (catalog, GGUF, imatrix, logits, KLD) is keyed by the hash of its full input config, so re-runs reuse everything unchanged.
 

@@ -28,7 +28,4 @@ After `odg resolve --prefer-hf --download-weights`, Step 02 indexes `*.safetenso
 
 | File | Role |
 |---|---|
-| `odg/load/load.py` | Orchestrator |
-| `odg/load/gguf_load.py` | GGUF header + tensor table |
-| `odg/load/hf_load.py` | HF directory / safetensors |
-| `odg/load/types.py` | `LoadedModel` |
+| `load.py` | Orchestrator + GGUF/HF open + `LoadedModel` types |

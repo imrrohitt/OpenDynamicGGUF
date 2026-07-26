@@ -116,7 +116,7 @@ def resolve(user_ref: str) -> ResolvedModel:
 
 ## Implementation
 
-See [01-resolve-model-impl.md](./01-resolve-model-impl.md) and package `odg/resolve/`.
+See [01-resolve-model-impl.md](./01-resolve-model-impl.md) and module `resolve.py`.
 
 ```bash
 source .venv/bin/activate

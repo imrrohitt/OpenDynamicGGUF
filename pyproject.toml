@@ -27,11 +27,33 @@ Issues = "https://github.com/imrrohitt/OpenDynamicGGUF/issues"
 dev = ["pytest>=8.0"]
 
 [project.scripts]
-odg = "odg.cli:main"
+odg = "cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools.packages.find]
-include = ["odg*"]
+[tool.setuptools]
+py-modules = [
+  "cli",
+  "ui",
+  "store",
+  "steps",
+  "llama_bins",
+  "gguf_tensors",
+  "resolve",
+  "load",
+  "enumerate",
+  "classify",
+  "catalog",
+  "weight_features",
+  "corpus",
+  "activation_features",
+  "freeze",
+  "imatrix",
+  "logits",
+  "sensitivity",
+  "optimizer",
+  "export",
+  "validate",
+]

@@ -1,6 +1,6 @@
 # Step 01 — Implementation notes
 
-Code lives in `odg/resolve/`.
+Code lives in `resolve.py`.
 
 ```bash
 # from repo root
