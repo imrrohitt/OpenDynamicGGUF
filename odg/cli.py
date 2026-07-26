@@ -87,6 +87,31 @@ def main(argv: list[str] | None = None) -> int:
     p_cls.add_argument("--force", action="store_true")
     p_cls.add_argument("--no-explain", action="store_true")
 
+    # --- catalog (step 05) ---
+    p_cat = sub.add_parser(
+        "catalog",
+        help="Step 05: build tensor_catalog.json (source of truth for probes)",
+    )
+    p_cat.add_argument("--model", "-m", default=None)
+    p_cat.add_argument("--run", default=None)
+    p_cat.add_argument("--force", action="store_true")
+    p_cat.add_argument("--no-explain", action="store_true")
+
+    # --- weight-features (step 06) ---
+    p_wf = sub.add_parser(
+        "weight-features",
+        help="Step 06: compute weight stats (mean/var/sparsity/outliers/norms)",
+    )
+    p_wf.add_argument("--model", "-m", default=None)
+    p_wf.add_argument("--run", default=None)
+    p_wf.add_argument("--force", action="store_true")
+    p_wf.add_argument(
+        "--only-quantizable",
+        action="store_true",
+        help="Skip non-quantizable tensors (norms, etc.)",
+    )
+    p_wf.add_argument("--no-explain", action="store_true")
+
     # --- status / runs ---
     p_status = sub.add_parser("status", help="Show checkpoint status for a run")
     p_status.add_argument("--run", default=None, help="run_id (default: latest for --model)")
@@ -104,6 +129,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_enumerate(args)
     if args.command == "classify":
         return cmd_classify(args)
+    if args.command == "catalog":
+        return cmd_catalog(args)
+    if args.command == "weight-features":
+        return cmd_weight_features(args)
     if args.command == "status":
         return cmd_status(args)
     if args.command == "runs":
@@ -508,6 +537,251 @@ def cmd_classify(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_catalog(args: argparse.Namespace) -> int:
+    import hashlib
+
+    from odg.catalog import build_catalog
+    from odg.store import StepAlreadyDone
+
+    print_explain = not args.no_explain
+    store = _store(args)
+
+    try:
+        meta = _require_run(store, model=args.model, run_id=args.run)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if not store.is_step_done(meta.run_id, "classify"):
+        print(
+            "ERROR: Step 04 (classify) is not done.\n"
+            f"  Run: odg classify --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if print_explain:
+        _banner_catalog(meta.model_ref, meta.run_id, meta.root)
+
+    if store.is_step_done(meta.run_id, "catalog") and not args.force:
+        out = store.read_step_output(meta.run_id, "catalog")
+        if print_explain:
+            print("Step 05 already checkpointed as done — loading from store.")
+            print(f"  path: {store.step_path(meta.run_id, 'catalog')}")
+            print("  (pass --force to re-run)\n")
+            print(json.dumps(out, indent=2))
+            print("\n" + store.summary(meta.run_id))
+        elif out:
+            print(json.dumps(out, indent=2))
+        return 0
+
+    classified_path = store.step_path(meta.run_id, "classify") / "classified.json"
+    if not classified_path.is_file():
+        print(f"ERROR: missing {classified_path}", file=sys.stderr)
+        return 1
+    classified = json.loads(classified_path.read_text())
+    tensors = classified.get("tensors") or []
+
+    resolve_out = store.read_step_output(meta.run_id, "resolve") or {}
+    load_out = store.read_step_output(meta.run_id, "load") or {}
+
+    source_path = load_out.get("source_path") or resolve_out.get("local_path")
+    source_sha = resolve_out.get("source_sha256")
+    if source_path and not source_sha:
+        try:
+            h = hashlib.sha256()
+            with open(source_path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            source_sha = h.hexdigest()
+        except OSError:
+            source_sha = None
+
+    input_data = {
+        "from_step": "classify",
+        "classified_path": str(classified_path),
+        "n_tensors_in": len(tensors),
+        "source_path": source_path,
+    }
+
+    try:
+        step_dir = store.begin_step(
+            meta.run_id, "catalog", input_data, force=args.force
+        )
+    except StepAlreadyDone:
+        return cmd_catalog(args)
+
+    try:
+        catalog = build_catalog(
+            tensors,
+            model_ref=meta.model_ref,
+            hf_repo_id=resolve_out.get("hf_repo_id"),
+            source_path=source_path,
+            source_backend=load_out.get("backend"),
+            source_is_quantized=bool(
+                load_out.get("source_is_quantized")
+                or resolve_out.get("source_is_quantized")
+            ),
+            source_sha256=source_sha,
+            n_layers=load_out.get("layer_count") or classified.get("n_layers"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        store.fail_step(meta.run_id, "catalog", str(exc))
+        print(f"\nERROR in Step 05 catalog: {exc}", file=sys.stderr)
+        return 1
+
+    payload = catalog.summary_dict()
+    full = catalog.to_dict()
+    log_text = "\n".join(catalog.steps_log) + "\n"
+
+    store.complete_step(
+        meta.run_id,
+        "catalog",
+        payload,
+        log_text=log_text,
+        extra_artifacts={
+            "tensor_catalog.json": json.dumps(full, indent=2).encode("utf-8") + b"\n",
+        },
+    )
+
+    if print_explain:
+        _explain_catalog(catalog)
+        print("\n=== checkpoint saved ===")
+        print(f"  run_id   : {meta.run_id}")
+        print(f"  step dir : {step_dir}")
+        print("  files    : output.json, tensor_catalog.json, status.json, log.txt")
+        print("\n" + store.summary(meta.run_id))
+        print("\n=== catalog summary (JSON) ===")
+        print(json.dumps(payload, indent=2))
+    else:
+        print(json.dumps(payload, indent=2))
+
+    return 0
+
+
+def cmd_weight_features(args: argparse.Namespace) -> int:
+    from odg.store import StepAlreadyDone
+    from odg.weight_features import compute_catalog_weight_features
+
+    print_explain = not args.no_explain
+    store = _store(args)
+
+    try:
+        meta = _require_run(store, model=args.model, run_id=args.run)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if not store.is_step_done(meta.run_id, "catalog"):
+        print(
+            "ERROR: Step 05 (catalog) is not done.\n"
+            f"  Run: odg catalog --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if print_explain:
+        _banner_weight_features(meta.model_ref, meta.run_id, meta.root)
+
+    if store.is_step_done(meta.run_id, "weight_features") and not args.force:
+        out = store.read_step_output(meta.run_id, "weight_features")
+        if print_explain:
+            print("Step 06 already checkpointed as done — loading from store.")
+            print(f"  path: {store.step_path(meta.run_id, 'weight_features')}")
+            print("  (pass --force to re-run)\n")
+            print(json.dumps(out, indent=2))
+            print("\n" + store.summary(meta.run_id))
+        elif out:
+            print(json.dumps(out, indent=2))
+        return 0
+
+    catalog_path = store.step_path(meta.run_id, "catalog") / "tensor_catalog.json"
+    if not catalog_path.is_file():
+        print(f"ERROR: missing {catalog_path}", file=sys.stderr)
+        return 1
+    catalog = json.loads(catalog_path.read_text())
+    source_path = catalog.get("source_path")
+    load_out = store.read_step_output(meta.run_id, "load") or {}
+    if not source_path:
+        source_path = load_out.get("source_path")
+
+    input_data = {
+        "from_step": "catalog",
+        "catalog_path": str(catalog_path),
+        "source_path": source_path,
+        "only_quantizable": bool(args.only_quantizable),
+        "n_tensors_in": len(catalog.get("tensors") or {}),
+    }
+
+    try:
+        step_dir = store.begin_step(
+            meta.run_id, "weight_features", input_data, force=args.force
+        )
+    except StepAlreadyDone:
+        return cmd_weight_features(args)
+
+    try:
+        updated, result = compute_catalog_weight_features(
+            catalog,
+            source_path=source_path,
+            only_quantizable=bool(args.only_quantizable),
+        )
+    except Exception as exc:  # noqa: BLE001
+        store.fail_step(meta.run_id, "weight_features", str(exc))
+        print(f"\nERROR in Step 06 weight-features: {exc}", file=sys.stderr)
+        return 1
+
+    payload = result.summary_dict()
+    # Keep payload JSON-friendly / not huge: drop full group_features map from summary
+    # (still written to weight_features.json + updated catalog)
+    payload_out = {
+        "model_ref": result.model_ref,
+        "source_path": result.source_path,
+        "source_is_quantized": result.source_is_quantized,
+        "n_tensors": result.n_tensors,
+        "n_with_features": result.n_with_features,
+        "n_skipped": result.n_skipped,
+        "catalog_sha256": result.catalog_sha256,
+        "hardest_groups": result.hardest_groups,
+        "easiest_groups": result.easiest_groups,
+        "steps_log": result.steps_log,
+        "notes": result.notes,
+    }
+    log_text = "\n".join(result.steps_log) + "\n"
+
+    store.complete_step(
+        meta.run_id,
+        "weight_features",
+        payload_out,
+        log_text=log_text,
+        extra_artifacts={
+            "tensor_catalog.json": json.dumps(updated, indent=2).encode("utf-8")
+            + b"\n",
+            "group_features.json": json.dumps(
+                result.group_features, indent=2
+            ).encode("utf-8")
+            + b"\n",
+        },
+    )
+
+    if print_explain:
+        _explain_weight_features(result)
+        print("\n=== checkpoint saved ===")
+        print(f"  run_id   : {meta.run_id}")
+        print(f"  step dir : {step_dir}")
+        print(
+            "  files    : output.json, tensor_catalog.json, "
+            "group_features.json, status.json, log.txt"
+        )
+        print("\n" + store.summary(meta.run_id))
+        print("\n=== weight-features summary (JSON) ===")
+        print(json.dumps(payload_out, indent=2))
+    else:
+        print(json.dumps(payload_out, indent=2))
+
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     store = _store(args)
     if args.run:
@@ -607,6 +881,116 @@ What this step does
   root   : {root}
 """.rstrip()
     )
+
+
+def _banner_catalog(model: str, run_id: str, root: str) -> None:
+    print(
+        """
+╔══════════════════════════════════════════════════════════════╗
+║  OpenDynamicGGUF — Step 05: Build tensor catalog            ║
+╚══════════════════════════════════════════════════════════════╝
+""".rstrip()
+    )
+    print(
+        f"""
+What this step does
+-------------------
+  Input : Step 04 classified.json (+ resolve/load provenance)
+  Model : {model}
+  Goal  : Single source-of-truth tensor_catalog.json with
+          gguf/hf names, roles, groups, and feature slots.
+
+  Checkpoint
+  ----------
+  run_id : {run_id}
+  root   : {root}
+""".rstrip()
+    )
+
+
+def _explain_catalog(catalog) -> None:
+    print("\n=== what happened ===")
+    for line in catalog.steps_log:
+        print(f"  • {line}")
+
+    print("\n=== verdict ===")
+    print(f"  ✓ Tensors            : {catalog.n_tensors}")
+    print(f"  ✓ Groups             : {catalog.n_groups}")
+    print(f"  ✓ Quantizable        : {catalog.n_quantizable}")
+    print(f"  ✓ catalog_sha256     : {catalog.catalog_sha256[:24]}…")
+    print(f"  ✓ source_sha256      : {(catalog.source_sha256 or '-')[:24]}…")
+    print(f"  ✓ Backend            : {catalog.source_backend}")
+
+    print("\n=== sample catalog entries ===")
+    for i, (name, t) in enumerate(catalog.tensors.items()):
+        if i >= 6:
+            break
+        print(f"  {name}")
+        print(f"      role={t.role} depth={t.depth} group={t.group_id} Q={t.quantizable}")
+        print(f"      hf_name={t.hf_name}")
+
+    print("\n=== next ===")
+    print("  Step 06 — compute weight features (fill weight_features slots).")
+
+
+def _banner_weight_features(model: str, run_id: str, root: str) -> None:
+    print(
+        """
+╔══════════════════════════════════════════════════════════════╗
+║  OpenDynamicGGUF — Step 06: Weight features                 ║
+╚══════════════════════════════════════════════════════════════╝
+""".rstrip()
+    )
+    print(
+        f"""
+What this step does
+-------------------
+  Input : Step 05 tensor_catalog.json + GGUF weights
+  Model : {model}
+  Goal  : Cheap per-tensor stats (mean/var/sparsity/outliers/norms)
+          to RANK which groups to probe first — not final bits.
+
+  Checkpoint
+  ----------
+  run_id : {run_id}
+  root   : {root}
+""".rstrip()
+    )
+
+
+def _explain_weight_features(result) -> None:
+    print("\n=== what happened ===")
+    for line in result.steps_log:
+        print(f"  • {line}")
+
+    print("\n=== verdict ===")
+    print(f"  ✓ Features filled   : {result.n_with_features}/{result.n_tensors}")
+    print(f"  ✓ Skipped           : {result.n_skipped}")
+    print(f"  ✓ catalog_sha256    : {result.catalog_sha256[:24]}…")
+    print(f"  ✓ Source quantized  : {result.source_is_quantized}")
+
+    print("\n=== hardest groups (probe these carefully) ===")
+    for g in result.hardest_groups[:5]:
+        print(
+            f"  {g['group_id']:<22} hardness={g.get('hardness', 0):.4f} "
+            f"outlier={g.get('outlier_ratio_mean', 0):.4f} "
+            f"var={g.get('variance_mean', 0):.6f}"
+        )
+
+    print("\n=== easiest groups ===")
+    for g in result.easiest_groups[:5]:
+        print(
+            f"  {g['group_id']:<22} hardness={g.get('hardness', 0):.4f} "
+            f"sparsity={g.get('sparsity_mean', 0):.3f}"
+        )
+
+    if result.notes:
+        print("\n=== notes ===")
+        for n in result.notes:
+            print(f"  • {n}")
+
+    print("\n=== next ===")
+    print("  Step 07 — build calibration corpus (calib / search / held-out).")
 
 
 def _banner_classify(model: str, run_id: str, root: str) -> None:

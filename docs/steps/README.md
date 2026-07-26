@@ -47,8 +47,8 @@ Each step file answers the same questions:
 | 02 | Load model | [02-load-model.md](./02-load-model.md) · [impl](./02-load-model-impl.md) | Open GGUF/HF and build tensor index |
 | 03 | Enumerate tensors | [03-enumerate-tensors.md](./03-enumerate-tensors.md) | Flat inventory: name / shape / dtype / nbytes |
 | 04 | Classify tensors | [04-classify-tensors.md](./04-classify-tensors.md) | Map each name → role / depth / quantizable |
-| 05 | Build catalog | [05-build-tensor-catalog.md](./05-build-tensor-catalog.md) | Structured inventory of all tensors |
-| 06 | Weight features | [06-compute-weight-features.md](./06-compute-weight-features.md) | Mean/var/norms from weights alone |
+| 05 | Build catalog | [05-build-tensor-catalog.md](./05-build-tensor-catalog.md) | `tensor_catalog.json` source of truth |
+| 06 | Weight features | [06-compute-weight-features.md](./06-compute-weight-features.md) | `odg weight-features` — mean/var/norms + hardness |
 | 07 | Calibration corpus | [07-build-calibration-corpus.md](./07-build-calibration-corpus.md) | Mixed text + 3-way split |
 | 08 | Activation features | [08-compute-activation-features.md](./08-compute-activation-features.md) | Run text → hidden-state stats |
 | 09 | Freeze BF16 GGUF | [09-freeze-bf16-gguf.md](./09-freeze-bf16-gguf.md) | HF → hashed BF16 GGUF for llama.cpp |
