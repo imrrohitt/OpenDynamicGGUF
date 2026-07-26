@@ -1,4 +1,4 @@
-# Step 09 — Freeze the BF16 GGUF reference
+# Step 09 — Freeze the GGUF reference
 
 ← [08 Activations](./08-compute-activation-features.md) · [Index](./README.md) · Next: [10 Imatrix](./10-build-imatrix.md) →
 
@@ -6,65 +6,59 @@
 
 ## Goal
 
-Convert the same HF BF16 checkpoint into a **frozen, hashed BF16 GGUF**. All llama.cpp probes, imatrix, and exports use this file.
+Produce one **frozen, hashed GGUF** that all llama.cpp probes, imatrix, and exports use.
+
+Ideal: HF BF16 → `model-bf16.gguf`.  
+Pragmatic (current Ollama path): promote the working GGUF → `model-ref.gguf` + SHA.
 
 ---
 
-## Why it exists
-
-Two views of the **same** weights:
-
-| View | Tooling | Purpose |
-|---|---|---|
-| HF / PyTorch | Steps 02–08 | Catalog, weight/activation features |
-| BF16 GGUF | Steps 09–15 | imatrix, trial quant, KLD, final export |
-
-If these diverge, measurements become meaningless. Hash the GGUF and record it everywhere.
-
----
-
-## Inputs / Outputs
-
-| | |
-|---|---|
-| **Input** | Same BF16 HF path as Step 01 |
-| **Output** | `model-bf16.gguf` + SHA-256 |
-
----
-
-## How it works
+## Command
 
 ```bash
-python llama.cpp/convert_hf_to_gguf.py \
-  ./model-src \
-  --outtype bf16 \
-  --outfile model-bf16.gguf
+odg freeze-gguf --model functiongemma:latest
 
-sha256sum model-bf16.gguf > model-bf16.gguf.sha256
+# Require true BF16 (needs HF weights + llama.cpp converter):
+export LLAMA_CPP_DIR=~/llama.cpp
+odg resolve --model functiongemma:latest --prefer-hf --download-weights --force
+odg freeze-gguf --model functiongemma:latest --mode hf-convert --require-bf16 --force
 ```
 
-Verify catalog GGUF names match tensors inside the file (optional `llama-gguf` / dump tool).
+Requires Step 08 done.
 
 ---
 
-## Example
+## Modes
+
+| Mode | Behavior |
+|---|---|
+| `auto` | HF convert if possible; else promote source GGUF |
+| `hf-convert` | Fail unless `convert_hf_to_gguf.py` + HF dir work |
+| `promote` | Always hardlink/symlink/copy the resolve/load GGUF |
+
+---
+
+## Outputs
 
 ```text
-Input:  ~/.cache/odg/models/gemma-3-270m/   (safetensors)
-Output: artifacts/model-bf16.gguf
-Size:   ~540 MB (bf16 for ~270M params)
-SHA:    9f2c…
+steps/09_freeze_gguf/
+  model-bf16.gguf          # or model-ref.gguf if not BF16
+  model-*.gguf.sha256
+  freeze_manifest.json
+  output.json
+  status.json
+  log.txt
 ```
 
-Recipe / cache key later includes this SHA so results are reproducible.
+Also verifies catalog tensor names ⊆ GGUF tensor index.
 
 ---
 
 ## Done when
 
-- [ ] BF16 GGUF exists and loads in llama.cpp
-- [ ] SHA recorded next to catalog `source_sha256`
-- [ ] Confirmed not accidentally F32-duplicated or already quantized
+- [x] Frozen GGUF exists under the step dir with SHA-256
+- [x] Catalog names checked against the file
+- [x] Manifest records whether it is a true BF16 reference
 
 ## Next
 

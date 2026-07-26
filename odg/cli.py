@@ -151,6 +151,33 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_af.add_argument("--no-explain", action="store_true")
 
+    # --- freeze-gguf (step 09) ---
+    p_fz = sub.add_parser(
+        "freeze-gguf",
+        help="Step 09: freeze hashed GGUF reference (BF16 convert or promote source)",
+    )
+    p_fz.add_argument("--model", "-m", default=None)
+    p_fz.add_argument("--run", default=None)
+    p_fz.add_argument("--force", action="store_true")
+    p_fz.add_argument(
+        "--mode",
+        choices=("auto", "hf-convert", "promote"),
+        default="auto",
+        help="auto: HF→BF16 if possible, else promote working GGUF",
+    )
+    p_fz.add_argument(
+        "--convert-script",
+        type=Path,
+        default=None,
+        help="Path to llama.cpp convert_hf_to_gguf.py (or set LLAMA_CPP_DIR)",
+    )
+    p_fz.add_argument(
+        "--require-bf16",
+        action="store_true",
+        help="Fail unless the frozen file is BF16/F16 (not Q8)",
+    )
+    p_fz.add_argument("--no-explain", action="store_true")
+
     # --- status / runs ---
     p_status = sub.add_parser("status", help="Show checkpoint status for a run")
     p_status.add_argument("--run", default=None, help="run_id (default: latest for --model)")
@@ -176,6 +203,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_corpus(args)
     if args.command == "activation-features":
         return cmd_activation_features(args)
+    if args.command == "freeze-gguf":
+        return cmd_freeze_gguf(args)
     if args.command == "status":
         return cmd_status(args)
     if args.command == "runs":
@@ -1090,6 +1119,135 @@ def cmd_activation_features(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_freeze_gguf(args: argparse.Namespace) -> int:
+    from odg.freeze import freeze_gguf
+    from odg.store import StepAlreadyDone
+
+    print_explain = not args.no_explain
+    store = _store(args)
+
+    try:
+        meta = _require_run(store, model=args.model, run_id=args.run)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if not store.is_step_done(meta.run_id, "activation_features"):
+        print(
+            "ERROR: Step 08 (activation-features) is not done.\n"
+            f"  Run: odg activation-features --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if print_explain:
+        _banner_freeze_gguf(meta.model_ref, meta.run_id, meta.root)
+
+    if store.is_step_done(meta.run_id, "freeze_gguf") and not args.force:
+        out = store.read_step_output(meta.run_id, "freeze_gguf")
+        if print_explain:
+            print("Step 09 already checkpointed as done — loading from store.")
+            print(f"  path: {store.step_path(meta.run_id, 'freeze_gguf')}")
+            print("  (pass --force to re-run)\n")
+            print(json.dumps(out, indent=2))
+            print("\n" + store.summary(meta.run_id))
+        elif out:
+            print(json.dumps(out, indent=2))
+        return 0
+
+    resolve_out = store.read_step_output(meta.run_id, "resolve") or {}
+    load_out = store.read_step_output(meta.run_id, "load") or {}
+
+    source_path = load_out.get("source_path") or resolve_out.get("local_path")
+    source_is_quantized = bool(
+        load_out.get("source_is_quantized") or resolve_out.get("source_is_quantized")
+    )
+
+    hf_local = None
+    local_path = resolve_out.get("local_path")
+    if local_path and Path(local_path).is_dir():
+        hf_local = local_path
+
+    # Catalog names for verification (prefer activation-features catalog)
+    catalog_names: list[str] = []
+    for step_id in ("activation_features", "weight_features", "catalog"):
+        cpath = store.step_path(meta.run_id, step_id) / "tensor_catalog.json"
+        if cpath.is_file():
+            cat = json.loads(cpath.read_text())
+            catalog_names = list((cat.get("tensors") or {}).keys())
+            break
+
+    input_data = {
+        "from_step": "activation_features",
+        "mode": args.mode,
+        "source_path": source_path,
+        "hf_local_path": hf_local,
+        "require_bf16": bool(args.require_bf16),
+        "convert_script": str(args.convert_script) if args.convert_script else None,
+        "n_catalog_tensors": len(catalog_names),
+    }
+
+    try:
+        step_dir = store.begin_step(
+            meta.run_id, "freeze_gguf", input_data, force=args.force
+        )
+    except StepAlreadyDone:
+        return cmd_freeze_gguf(args)
+
+    try:
+        result = freeze_gguf(
+            model_ref=meta.model_ref,
+            out_dir=step_dir,
+            source_path=source_path,
+            source_is_quantized=source_is_quantized,
+            hf_local_path=hf_local,
+            catalog_tensor_names=catalog_names,
+            mode=args.mode,
+            convert_script=args.convert_script,
+            require_bf16=bool(args.require_bf16),
+        )
+    except Exception as exc:  # noqa: BLE001
+        store.fail_step(meta.run_id, "freeze_gguf", str(exc))
+        print(f"\nERROR in Step 09 freeze-gguf: {exc}", file=sys.stderr)
+        return 1
+
+    payload = result.summary_dict()
+    log_text = "\n".join(result.steps_log) + "\n"
+    manifest = {
+        **payload,
+        "gguf_sha256_file": result.gguf_path + ".sha256",
+    }
+
+    # GGUF already in step_dir; record sha + manifest as extras
+    store.complete_step(
+        meta.run_id,
+        "freeze_gguf",
+        payload,
+        log_text=log_text,
+        extra_artifacts={
+            "freeze_manifest.json": json.dumps(manifest, indent=2).encode("utf-8")
+            + b"\n",
+        },
+    )
+
+    if print_explain:
+        _explain_freeze_gguf(result)
+        print("\n=== checkpoint saved ===")
+        print(f"  run_id   : {meta.run_id}")
+        print(f"  step dir : {step_dir}")
+        print(
+            "  files    : output.json, model-*.gguf, *.sha256, "
+            "freeze_manifest.json, status.json, log.txt"
+        )
+        print("\n" + store.summary(meta.run_id))
+        print("\n=== freeze-gguf summary (JSON) ===")
+        print(json.dumps(payload, indent=2))
+    else:
+        print(json.dumps(payload, indent=2))
+
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     store = _store(args)
     if args.run:
@@ -1420,6 +1578,55 @@ def _explain_activation_features(result) -> None:
 
     print("\n=== next ===")
     print("  Step 09 — freeze BF16 GGUF for llama.cpp (imatrix / probes).")
+
+
+def _banner_freeze_gguf(model: str, run_id: str, root: str) -> None:
+    print(
+        """
+╔══════════════════════════════════════════════════════════════╗
+║  OpenDynamicGGUF — Step 09: Freeze GGUF reference           ║
+╚══════════════════════════════════════════════════════════════╝
+""".rstrip()
+    )
+    print(
+        f"""
+What this step does
+-------------------
+  Input : HF BF16 dir (ideal) or working GGUF from resolve/load
+  Model : {model}
+  Goal  : One hashed GGUF file for imatrix / probes / export.
+          Ideal: convert_hf_to_gguf.py --outtype bf16
+          Now:   promote Ollama/Q8 GGUF if BF16 convert unavailable.
+
+  Checkpoint
+  ----------
+  run_id : {run_id}
+  root   : {root}
+""".rstrip()
+    )
+
+
+def _explain_freeze_gguf(result) -> None:
+    print("\n=== what happened ===")
+    for line in result.steps_log:
+        print(f"  • {line}")
+
+    print("\n=== verdict ===")
+    print(f"  ✓ Method            : {result.method}")
+    print(f"  ✓ GGUF              : {result.gguf_path}")
+    print(f"  ✓ sha256            : {result.gguf_sha256[:32]}…")
+    print(f"  ✓ Size              : {result.gguf_nbytes / (1024**2):.1f} MiB")
+    print(f"  ✓ BF16 reference    : {result.is_bf16_reference}")
+    print(f"  ✓ dtypes            : {result.dtype_summary}")
+    print(f"  ✓ Catalog match     : {result.catalog_match}")
+
+    if result.notes:
+        print("\n=== notes ===")
+        for n in result.notes:
+            print(f"  • {n}")
+
+    print("\n=== next ===")
+    print("  Step 10 — build imatrix from calib.txt + this frozen GGUF.")
 
 
 def _banner_classify(model: str, run_id: str, root: str) -> None:

@@ -55,7 +55,7 @@ output                -> Q8_0     (pinned)
 ```
 
 > [!IMPORTANT]
-> This project is in **alpha**. Steps 00–06 of the pipeline (resolve → load → enumerate → classify → catalog → weight features) are implemented and usable today; `odg quantize` is the target end-to-end command and lands with milestone M3. See [Project status](#project-status).
+> This project is in **alpha**. Steps **00–08** are implemented and usable today (resolve → load → enumerate → classify → catalog → weight features → calibration corpus → activation features). `odg quantize` is the target end-to-end command and lands with milestone M3. See [Project status](#project-status).
 
 ### What makes it different
 
@@ -136,6 +136,9 @@ odg weight-features --model functiongemma:latest --only-quantizable
 # 07 · mixed calibration corpus, split into calib / search / held-out
 odg corpus --model functiongemma:latest --target-tokens 300000
 
+# 08 · activation stats from the calib split (forward hooks if possible, else proxy)
+odg activation-features --model functiongemma:latest
+
 # inspect progress
 odg status --model functiongemma:latest
 odg runs
@@ -153,6 +156,8 @@ Useful flags:
 | `--force` | Recompute a step that is already checkpointed as done |
 | `--only-quantizable` | Skip norms and other non-quantizable tensors when computing features |
 | `--target-tokens` / `--seed` | Corpus size budget and split seed for `odg corpus` |
+| `--mode auto\|forward\|proxy` | Activation-features strategy (`auto` tries a real forward pass, else proxy) |
+| `--max-docs` | Cap how many calib docs are used in a forward activation pass |
 | `--no-explain` | Suppress the human-readable explanation printed after each step |
 
 ---
@@ -172,7 +177,7 @@ The pipeline is split into 16 small steps, each with its own design doc. Start a
 | 06 | Weight features | [doc](docs/steps/06-compute-weight-features.md) | `odg weight-features` | ✅ Implemented |
 | 07 | Calibration corpus | [doc](docs/steps/07-build-calibration-corpus.md) | `odg corpus` | ✅ Implemented |
 | 08 | Activation features | [doc](docs/steps/08-compute-activation-features.md) | `odg activation-features` | ✅ Implemented (proxy; forward optional) |
-| 09 | Freeze BF16 GGUF | [doc](docs/steps/09-freeze-bf16-gguf.md) | — | 🚧 Planned |
+| 09 | Freeze BF16 GGUF | [doc](docs/steps/09-freeze-bf16-gguf.md) | `odg freeze-gguf` | ✅ Implemented (promote; HF convert optional) |
 | 10 | Build imatrix | [doc](docs/steps/10-build-imatrix.md) | — | 🚧 Planned |
 | 11 | Cache reference logits | [doc](docs/steps/11-cache-reference-logits.md) | — | 🚧 Planned |
 | 12 | Sensitivity probe | [doc](docs/steps/12-sensitivity-probe.md) | — | 🚧 Planned |
@@ -829,25 +834,27 @@ validation:
 ```text
 OpenDynamicGGUF/
 ├── odg/
-│   ├── cli.py               # odg <command> entry point
-│   ├── store.py             # filesystem run store: checkpoints, resume, status
-│   ├── steps.py             # step registry / ordering
-│   ├── gguf_tensors.py      # GGUF tensor-name helpers
-│   ├── resolve/             # 01 · any ref → original BF16 + architecture descriptor
-│   ├── load/                # 02 · open GGUF/HF checkpoint, build tensor index
-│   ├── enumerate/           # 03 · flat inventory: name / shape / dtype / nbytes
-│   ├── classify/            # 04 · role / depth / quantizable per tensor
-│   ├── catalog/             # 05 · tensor_catalog.json — source of truth
-│   ├── weight_features/     # 06 · mean / var / sparsity / outliers / norms
-│   └── corpus/              # 07 · mixed calibration text + 3-way split
+│   ├── cli.py                  # odg <command> entry point
+│   ├── store.py                # filesystem run store: checkpoints, resume, status
+│   ├── steps.py                # step registry / ordering
+│   ├── gguf_tensors.py         # GGUF tensor-name helpers
+│   ├── resolve/                # 01 · any ref → original BF16 + architecture descriptor
+│   ├── load/                   # 02 · open GGUF/HF checkpoint, build tensor index
+│   ├── enumerate/              # 03 · flat inventory: name / shape / dtype / nbytes
+│   ├── classify/               # 04 · role / depth / quantizable per tensor
+│   ├── catalog/                # 05 · tensor_catalog.json — source of truth
+│   ├── weight_features/        # 06 · mean / var / sparsity / outliers / norms
+│   ├── corpus/                 # 07 · mixed calibration text + 3-way split
+│   └── activation_features/    # 08 · activation range / outliers (forward or proxy)
 ├── docs/
-│   ├── assets/              # banner and diagrams
-│   └── steps/               # one design doc per pipeline step (00–15)
-├── artifacts/               # run store output (git-ignored)
+│   ├── assets/                 # logo and diagrams
+│   └── steps/                  # one design doc per pipeline step (00–15)
+├── artifacts/                  # run store output (git-ignored)
+├── LICENSE
 └── pyproject.toml
 ```
 
-Planned modules, one per remaining step: `corpus/` (07), `activation_features/` (08), `ingest/` (09), `imatrix/` (10), `logits/` (11), `sensitivity/` (12), `optimizer/` (13), `export/` (14), `validate/` (15).
+Planned modules, one per remaining step: `ingest/` (09), `imatrix/` (10), `logits/` (11), `sensitivity/` (12), `optimizer/` (13), `export/` (14), `validate/` (15).
 
 Every artifact (catalog, GGUF, imatrix, logits, KLD) is keyed by the hash of its full input config, so re-runs reuse everything unchanged.
 
@@ -859,9 +866,11 @@ Three shippable milestones — each independently useful before the next exists:
 
 | Milestone | Scope | Standalone value |
 |---|---|---|
-| **M1** | Resolver + catalog + llama.cpp runners + Tier-1 KLD harness | Inspect any model's tensor map; audit existing GGUFs |
-| **M2** | Activation features + sensitivity prober | Publish ΔKLD/Δbytes tables for any model |
+| **M1** | Resolver + catalog + corpus + features + llama.cpp runners + Tier-1 KLD harness | Inspect any model's tensor map; audit existing GGUFs |
+| **M2** | Freeze BF16 + imatrix + sensitivity prober | Publish ΔKLD/Δbytes tables for any model |
 | **M3** | Optimizer + full gate loop | End-to-end `odg quantize` → GGUF + recipe + report |
+
+**Today:** steps 00–08 ship under M1 (features + corpus). Remaining M1 work is llama.cpp runners + the Tier-1 KLD harness.
 
 Later experiments (explicitly *not* v1): smarter search (Bayesian / evolutionary), per-expert bit allocation from usage counts, KV-cache quantization sensitivity, attention-head and neuron-level importance, LLM-in-the-loop failure analysis suggesting recipe changes.
 
@@ -901,7 +910,7 @@ Nothing here needs a cluster. For 70B+ or large MoE models the same pipeline app
 
 ## Contributing
 
-Contributions are very welcome — especially on the unimplemented steps (07–15), additional model families in the resolver, and role taxonomies for new architectures.
+Contributions are very welcome — especially on the unimplemented steps (09–15), additional model families in the resolver, and role taxonomies for new architectures.
 
 1. Read [`docs/steps/README.md`](docs/steps/README.md) and the doc for the step you want to touch. Each step doc states its goal, inputs/outputs, and a "done when" checklist.
 2. Keep the contract of a step intact: inputs and outputs are JSON artifacts in the run store, so steps stay independently runnable and resumable.
