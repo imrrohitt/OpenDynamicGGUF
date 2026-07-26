@@ -2090,6 +2090,25 @@ def cmd_validate(args: argparse.Namespace) -> int:
     resolve_out = store.read_step_output(meta.run_id, "resolve") or {}
     desc = resolve_out.get("descriptor") or {}
     sens_path = store.step_path(meta.run_id, "sensitivity") / "sensitivity.json"
+    opt_out = store.read_step_output(meta.run_id, "optimize") or {}
+    assignments = opt_out.get("assignments") or {}
+    opt_manifest_path = (
+        store.step_path(meta.run_id, "optimize") / "optimize_manifest.json"
+    )
+    optimize_manifest = None
+    if opt_manifest_path.is_file():
+        optimize_manifest = json.loads(opt_manifest_path.read_text())
+        if not assignments:
+            assignments = (optimize_manifest.get("primary") or {}).get(
+                "assignments"
+            ) or {}
+
+    catalog = None
+    for step_id in ("activation_features", "weight_features", "catalog"):
+        cpath = store.step_path(meta.run_id, step_id) / "tensor_catalog.json"
+        if cpath.is_file():
+            catalog = json.loads(cpath.read_text())
+            break
 
     input_data = {
         "from_step": "export",
@@ -2114,6 +2133,10 @@ def cmd_validate(args: argparse.Namespace) -> int:
             export_manifest=export_out,
             specialty_domain=desc.get("specialty_domain"),
             sensitivity_path=sens_path if sens_path.is_file() else None,
+            catalog=catalog,
+            assignments=assignments,
+            optimize_manifest=optimize_manifest,
+            resolve_descriptor=desc,
             mode=args.mode,
             allow_provisional=not args.strict,
         )
@@ -2829,6 +2852,9 @@ def _explain_validate(result) -> None:
     print(f"  ✓ Tier2 pass        : {result.tier2.get('pass')}")
     print(f"  ✓ Report            : {result.report_path}")
     print(f"  ✓ Release dir       : {result.release_dir or '-'}")
+    if result.report_card_paths:
+        print(f"  ✓ Report card HTML  : {result.report_card_paths.get('html')}")
+        print(f"  ✓ Report card MD    : {result.report_card_paths.get('md')}")
 
     if result.feedback:
         print("\n=== feedback to optimizer ===")
@@ -2842,6 +2868,8 @@ def _explain_validate(result) -> None:
 
     print("\n=== pipeline ===")
     print("  Steps 01–15 complete (plumbing). Install llama.cpp for real quant/KLD.")
+    if result.report_card_paths.get("html"):
+        print(f"  Open report card: {result.report_card_paths['html']}")
 
 
 def _banner_classify(model: str, run_id: str, root: str) -> None:

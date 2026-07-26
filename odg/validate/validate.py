@@ -14,6 +14,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Literal
 
+from .report_card import write_quantization_report_card
 from .types import ValidateResult
 
 Mode = Literal["auto", "llama", "proxy"]
@@ -284,6 +285,10 @@ def validate_and_release(
     export_manifest: dict[str, Any] | None = None,
     specialty_domain: str | None = None,
     sensitivity_path: str | Path | None = None,
+    catalog: dict[str, Any] | None = None,
+    assignments: dict[str, str] | None = None,
+    optimize_manifest: dict[str, Any] | None = None,
+    resolve_descriptor: dict[str, Any] | None = None,
     mode: Mode = "auto",
     allow_provisional: bool = True,
 ) -> ValidateResult:
@@ -361,38 +366,81 @@ def validate_and_release(
         export_out=candidate,
         export_nbytes=export_nbytes if isinstance(export_nbytes, int) else None,
     )
-    log.append(f"7. Wrote report.md + report.html")
+    log.append("7. Wrote report.md + report.html")
+
+    # Quantization report card (per-layer / per-group compression)
+    report_card_paths: dict[str, str] = {}
+    if catalog and assignments:
+        sens_rows = None
+        if sensitivity_path and Path(sensitivity_path).is_file():
+            try:
+                sens_rows = json.loads(Path(sensitivity_path).read_text()).get("rows")
+            except Exception:  # noqa: BLE001
+                sens_rows = None
+        validate_payload = {
+            "verdict": verdict,
+            "tier1": tier1,
+            "tier2": tier2,
+            "tier3": tier3,
+        }
+        report_card_paths = write_quantization_report_card(
+            out_dir,
+            model_ref=model_ref,
+            catalog=catalog,
+            assignments=assignments,
+            sensitivity_rows=sens_rows,
+            optimize_manifest=optimize_manifest,
+            validate_payload=validate_payload,
+            resolve_descriptor=resolve_descriptor
+            or ({"specialty_domain": specialty_domain} if specialty_domain else None),
+        )
+        log.append(
+            "8. Wrote quantization_report_card.html/.md/.json "
+            f"({len(assignments)} groups, layer-by-layer)"
+        )
+        notes.append(
+            f"Quantization report card: {report_card_paths.get('html')}"
+        )
+    else:
+        log.append("8. Skipped report card (catalog/assignments missing)")
 
     release_dir = None
+
+    def _stage_report_card(dest: Path) -> None:
+        for key in ("html", "md", "json"):
+            src = report_card_paths.get(key)
+            if src and Path(src).is_file():
+                shutil.copy2(src, dest / Path(src).name)
+
     if verdict == "RELEASE":
         release_dir_p = out_dir / "release"
         release_dir_p.mkdir(exist_ok=True)
         shutil.copy2(recipe_path, release_dir_p / "recipe.yaml")
         shutil.copy2(report_path, release_dir_p / "report.md")
         shutil.copy2(report_path.with_suffix(".html"), release_dir_p / "report.html")
+        _stage_report_card(release_dir_p)
         if candidate and Path(candidate).is_file():
             dest = release_dir_p / Path(candidate).name
             if Path(candidate).resolve() != dest.resolve():
                 shutil.copy2(candidate, dest)
         release_dir = str(release_dir_p)
-        log.append(f"8. Staged release/ artifacts")
+        log.append("9. Staged release/ artifacts (+ report card)")
         notes.append("RELEASE staged under steps/15_validate/release/")
     elif verdict == "PROVISIONAL":
-        # Still stage recipe + report for inspection
         release_dir_p = out_dir / "release_provisional"
         release_dir_p.mkdir(exist_ok=True)
         shutil.copy2(recipe_path, release_dir_p / "recipe.yaml")
         shutil.copy2(report_path, release_dir_p / "report.md")
         shutil.copy2(report_path.with_suffix(".html"), release_dir_p / "report.html")
-        # Copy quantize script from export if present
+        _stage_report_card(release_dir_p)
         release_dir = str(release_dir_p)
-        log.append("8. Staged release_provisional/ (no GGUF yet)")
+        log.append("9. Staged release_provisional/ (+ report card)")
     else:
         (out_dir / "feedback.json").write_text(
             json.dumps({"verdict": verdict, "feedback": feedback}, indent=2) + "\n",
             encoding="utf-8",
         )
-        log.append("8. Wrote feedback.json for optimizer")
+        log.append("9. Wrote feedback.json for optimizer")
         notes.append("FAIL — apply feedback constraints and re-run optimize/export.")
 
     if tier1.get("method") == "proxy_from_recipe":
@@ -411,6 +459,7 @@ def validate_and_release(
         feedback=feedback,
         report_path=str(report_path),
         release_dir=release_dir,
+        report_card_paths=report_card_paths,
         steps_log=log,
         notes=notes,
     )

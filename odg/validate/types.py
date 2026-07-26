@@ -17,6 +17,7 @@ class ValidateResult:
     feedback: list[dict[str, Any]]
     report_path: str
     release_dir: str | None
+    report_card_paths: dict[str, str] = field(default_factory=dict)
     steps_log: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 

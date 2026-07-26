@@ -31,10 +31,15 @@ Verdicts:
 ```text
 steps/15_validate/
   report.md / report.html
-  release/ or release_provisional/
+  quantization_report_card.html   # full per-layer / per-group card
+  quantization_report_card.md
+  quantization_report_card.json
+  release/ or release_provisional/   # copies of the above
   feedback.json          # on FAIL
   output.json
 ```
+
+The **Quantization Report Card** includes: architecture (layers/tensors), size vs baseline, compression by role, a per-layer matrix (attn_q/k/v/o + ffn_*), and per-group Δbytes / ΔKLD.
 
 ---
 
