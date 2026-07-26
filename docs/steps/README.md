@@ -42,7 +42,7 @@ Each step file answers the same questions:
 
 | # | Step | File | One-line summary |
 |---|---|---|---|
-| 01 | Resolve model | [01-resolve-model.md](./01-resolve-model.md) | Any user ref → original BF16 safetensors |
+| 01 | Resolve model | [01-resolve-model.md](./01-resolve-model.md) · [impl](./01-resolve-model-impl.md) | Any user ref → original BF16 HF |
 | 02 | Load model | [02-load-model.md](./02-load-model.md) | Load BF16 into memory with Transformers |
 | 03 | Enumerate tensors | [03-enumerate-tensors.md](./03-enumerate-tensors.md) | List every parameter via `state_dict()` |
 | 04 | Classify tensors | [04-classify-tensors.md](./04-classify-tensors.md) | Map each name → role (attn_q, ffn_up, …) |

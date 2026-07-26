@@ -110,9 +110,18 @@ def resolve(user_ref: str) -> ResolvedModel:
 
 ## Done when
 
-- [ ] You have a path to **full-precision** weights
-- [ ] Descriptor has family, layer count, chat template, specialty domain
-- [ ] Source hash recorded for caching / recipes
+- [x] You have identified the **full-precision** upstream (`google/functiongemma-270m-it` for `functiongemma:latest`)
+- [x] Descriptor has family, layer count, chat template, specialty domain (from Ollama/GGUF metadata; HF config when unlocked)
+- [ ] Source BF16 weights downloaded (requires Hugging Face login for gated Gemma repos)
+
+## Implementation
+
+See [01-resolve-model-impl.md](./01-resolve-model-impl.md) and package `odg/resolve/`.
+
+```bash
+source .venv/bin/activate
+odg resolve --model functiongemma:latest --out artifacts/resolve-functiongemma.json
+```
 
 ## Next
 
