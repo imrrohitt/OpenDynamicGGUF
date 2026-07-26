@@ -27,6 +27,23 @@ output                -> Q8_0     (pinned)
 
 ---
 
+## Step-by-step architecture (detailed)
+
+The pipeline is broken into **15 small steps**, each with its own doc (goal, why, inputs/outputs, how, examples, checklist):
+
+**→ Start here: [`docs/steps/README.md`](docs/steps/README.md)**
+
+| Steps | What they cover |
+|---|---|
+| [01–05](docs/steps/01-resolve-model.md) | Resolve → load → enumerate → classify → catalog |
+| [06–08](docs/steps/06-compute-weight-features.md) | Weight features → calibration corpus → activation features |
+| [09–11](docs/steps/09-freeze-bf16-gguf.md) | Freeze BF16 GGUF → imatrix → reference logits |
+| [12–15](docs/steps/12-sensitivity-probe.md) | Probe ΔKLD → optimize recipe → export → validate |
+
+The sections below are the **condensed** architecture. For teachable detail and examples, use the step files.
+
+---
+
 ## Table of contents
 
 1. [Why this project exists](#1-why-this-project-exists)
@@ -77,7 +94,7 @@ OpenDynamicGGUF is the **measurement, search, and validation loop around these t
 
 1. **Never requantize quantized weights.** Quantization error compounds. Every input reference is traced back to its original full-precision source before anything else happens.
 2. **KL divergence to the full-precision model is the primary objective** — not perplexity alone, and not benchmark scores during search. Logit-level fidelity is cheap to compute, sensitive, and doesn't saturate.
-3. **Statistics prioritize; probes decide.** Mean, variance, sparsity, outlier ratio, norms, etc. are *features* used to rank groups and pick which bit-widths to try first. They are **never** the final accept/reject rule. Two layers can share identical statistics and still diverge wildly after quantization — only measured ΔKLD (or a similar output-distribution metric) is authoritative.
+3. **Statistics prioritize; probes decide.** Features come from two sources: **weights** (read from the tensor) and **activations** (from running real calibration text through the model). Both are used only to *rank* groups and pick which bit-widths to try first — never as the final accept/reject rule. Two layers can share identical weight stats and still diverge wildly after quantization; only measured ΔKLD is authoritative.
 4. **Hard wall between search data and judging data.** The optimizer never sees the data it will be validated on. This is the single rule that keeps results honest instead of overfit to their own calibration set.
 5. **Search over tensor groups, not individual tensors.** Role × depth grouping reduces ~300 tensors to ~25 groups, making the search tractable and the results interpretable.
 6. **Everything is content-addressed and cached.** A re-run recomputes only what changed. Probes, logits, imatrices, and candidate GGUFs are keyed by the hash of their full input configuration.
@@ -245,28 +262,43 @@ quantizable: true
 
 At this point you know **every tensor in the model** and how it maps into GGUF naming for `llama-quantize --tensor-type`.
 
-### 2e. Compute tensor features
+### 2e. Compute tensor features — two different data sources
 
-Iterate the catalog. Weight-side features are computed directly from the tensor; activation-side features need a short forward pass on the **calib** split (Stage 4) and can be filled in after the corpus exists — or computed here if calib text is already available.
+Features are **not** all computed the same way. There are two kinds of data.
 
-```text
-Per tensor (or per group aggregate):
-  mean, variance, entropy
-  sparsity, outlier_ratio
-  weight_norm, spectral_norm (approx OK for large mats)
-  activation_range / activation stats  ← from calib forward pass
-```
+#### Weight features (no external dataset)
 
-Example:
+These come from the parameter tensor itself:
 
 ```text
-model.layers.12.self_attn.q_proj.weight
-  mean=0.001  variance=0.05  entropy=6.8
-  sparsity=0.72  outlier_ratio=0.002
-  weight_norm=13.8  spectral_norm=2.9
+Model → weight tensor → mean / variance / sparsity / entropy /
+                        weight_norm / spectral_norm / outlier_ratio
 ```
 
-These features feed **sensitivity prediction / ranking only**. They do not accept or reject a bit-width by themselves (see Stage 6).
+No prompts required. Available as soon as the model is loaded.
+
+#### Activation features (require calibration text)
+
+These require a **forward pass on real text**:
+
+```text
+Calibration prompt → model → hidden activations → activation range,
+                                                   channel importance,
+                                                   which neurons fire hard
+```
+
+Without inference you only know weights. You do **not** know which neurons activate, which channels are unused, or which tensors matter for the model's real workload. Example: the same Layer-12 channel may sit near `0.2` on “What is AI?” and spike to `15.2` on “Write Python code” — that channel may deserve higher precision, and only activation stats reveal it.
+
+| Metric | Source | Needs calibration text? |
+|---|---|---|
+| Mean, variance, sparsity, entropy, weight / spectral norm, weight outlier ratio | Weight tensor | No |
+| Activation range, activation outliers, per-channel importance | Hidden states from forward pass | **Yes** |
+| Importance matrix (`imatrix`) | Aggregated activations over calib corpus | **Yes** |
+| ΔKLD / top-token agreement | BF16 logits vs quantized logits on search text | **Yes** (search split) |
+
+Practical order: compute weight features in Stage 2 immediately; fill activation features after Stage 4 produces the calib split (hooks or a short PyTorch calib pass). `llama-imatrix` is the llama.cpp-side automation of the activation-importance path (see Stage 5).
+
+These features feed **ranking only**. They do not accept or reject a bit-width by themselves (Stage 6).
 
 ### 2f. Persist the catalog
 
@@ -284,7 +316,7 @@ Write a content-addressed artifact (JSON or SQLite), e.g. `tensor_catalog.json`:
       "depth": "middle",
       "gguf_name": "blk.12.attn_q.weight",
       "quantizable": true,
-      "features": {
+      "weight_features": {
         "mean": 0.001,
         "variance": 0.05,
         "entropy": 6.8,
@@ -292,14 +324,19 @@ Write a content-addressed artifact (JSON or SQLite), e.g. `tensor_catalog.json`:
         "outlier_ratio": 0.002,
         "weight_norm": 13.8,
         "spectral_norm": 2.9
+      },
+      "activation_features": {
+        "range_min": -4.2,
+        "range_max": 5.1,
+        "outlier_ratio": 0.003
       }
     }
   }
 }
 ```
 
-**Consumes:** resolved BF16 HF path + architecture descriptor.  
-**Produces:** `tensor_catalog.json` (names, roles, shapes, features, GGUF name map).  
+**Consumes:** resolved BF16 HF path + architecture descriptor (+ calib split once available for activations).  
+**Produces:** `tensor_catalog.json` (names, roles, shapes, weight/activation features, GGUF name map).  
 **Failure prevented:** probing “blind” without knowing which tensors exist, which roles they play, or which names to pass to `--tensor-type`.
 
 ## 6. Stage 3 — Ingest & freeze GGUF reference
@@ -319,28 +356,112 @@ Probing, export, and validation all derive from these exact GGUF bytes. The cata
 
 ## 7. Stage 4 — Calibration corpus & the three-way split
 
-The corpus is the text the quantization is optimized against. It must look like the model's real workload:
+This is one of the **most important** parts of the project. Activation statistics, the importance matrix, and KL divergence are **not** computed on random noise or from weights alone — they require **running real text through the model**.
 
-- **Domains:** conversation, code, reasoning/math, multilingual — plus the model's specialty domain from the resolver (e.g. real function-calling traces for a function-calling fine-tune).
-- **Chat-template rendered:** instruct models run inside a chat template; calibration text must too. Raw wikitext calibration never exercises the format the model actually sees — a documented weakness of most community imatrix quants.
-- **Scale:** roughly 0.3M–1.5M tokens depending on model size (in line with what Unsloth reports using).
+```text
+Prompt  →  Model  →  Hidden activations / logits  →  Stats, imatrix, ΔKLD
+```
 
-Then it is split three ways, with a hard wall between splits:
+That text is the **calibration corpus**.
+
+### Why text is required
+
+Weights alone never answer:
+
+- Which neurons activate on real workloads?
+- Which channels spike (and may need higher precision)?
+- Which experts fire (MoE)?
+- How much does quantizing group X shift the output distribution?
+
+Only a forward pass on representative prompts reveals that.
+
+### What the corpus looks like
+
+A calibration file is plain text — thousands of prompts concatenated, ideally rendered with the model's **chat template** for instruct models:
+
+```text
+User:
+Explain quantum mechanics.
+Assistant:
+…
+
+User:
+Write a Python function that merges two sorted lists.
+Assistant:
+…
+
+User:
+Solve: 25 × 37
+Assistant:
+…
+```
+
+There is no single standard dataset. Community GGUF builders commonly mix WikiText, C4, code, chat, math, and multilingual text (and publish reusable corpora). OpenDynamicGGUF is more deliberate than Wikipedia-only:
+
+| Domain | Target share | Why |
+|---|---|---|
+| Conversation / chat | ~30% | Matches instruct use |
+| Code | ~30% | Stresses different channels than prose |
+| Math / reasoning | ~20% | Exact-answer sensitivity |
+| Multilingual | ~10% | Avoid English-only activation bias |
+| Domain-specific | ~10% | From resolver metadata |
+
+**Domain examples:** for `functiongemma`, domain data = real function-calling traces (tool schemas + model responses) rendered in its chat template so activations match the intended workload. For a code-specialized fine-tune, lean harder on code.
+
+- **Scale:** roughly 0.3M–1.5M tokens depending on model size.
+- **Chat-template rendered:** raw wikitext never exercises the format instruct models actually see — a documented weakness of many community imatrix quants.
+
+### Three-way split (hard walls)
 
 | Split | Share | Used by | Purpose |
 |---|---|---|---|
-| **calib** | ~60% | `llama-imatrix` | Guides how each tensor is rounded |
-| **search** | ~20% | Sensitivity prober & optimizer | The objective (ΔKLD) is computed here |
-| **held-out** | ~20% | Validation gates **only** | The search never touches it |
+| **calib** | ~60% | `llama-imatrix`, activation-feature hooks | Guides rounding + fills activation stats |
+| **search** | ~20% | Sensitivity prober & optimizer | ΔKLD objective during search |
+| **held-out** | ~20% | Validation gates **only** | Search never touches it |
 
-**Failure prevented:** calibrating and evaluating on the same distribution. Most frameworks calibrate on Wikipedia-style text and then report KLD/perplexity on Wikipedia-style text — so the quants look better than they are. Splitting search data from judging data is the fix, and it is cheap.
+**Failure prevented:** calibrating and evaluating on the same distribution (Wikipedia in → Wikipedia KLD out looks better than it is).
+
+### Complete picture: weights vs activations vs KL
+
+```text
+                    BF16 Model
+                         │
+          ┌──────────────┴──────────────┐
+          │                             │
+   Weight tensors                Calibration / search text
+          │                             │
+          ▼                             ▼
+   Mean, variance                 Forward pass
+   Entropy, sparsity                    │
+   Weight / spectral norms              ▼
+   Weight outlier ratio          Hidden activations ──► activation range,
+                                                         channel importance
+                                                         imatrix (llama-imatrix)
+                                Logits (BF16 vs quant) ──► ΔKLD, top-token agree
+```
+
+Summary:
+
+- **Weight statistics** ← parameter tensors (no dataset).
+- **Activation statistics + imatrix** ← calib text through the model.
+- **KL divergence** ← comparing BF16 vs quantized **logits** on search/held-out text — not from the weights themselves.
 
 ## 8. Stage 5 — Reference artifacts (compute once)
 
-Two expensive full-precision artifacts are computed exactly once and cached for every candidate that follows:
+Two expensive full-precision artifacts are computed exactly once and cached for every candidate that follows.
+
+### What `llama-imatrix` does
+
+It automates the activation-importance path over the calib split:
+
+```text
+calib.txt  →  forward pass  →  collect / average activations  →  imatrix.gguf
+```
+
+`llama-quantize` later uses that file so rounding inside each tensor is guided by how the model actually activates — not by uniform assumptions.
 
 ```bash
-# Importance matrix (guides rounding within each tensor)
+# Importance matrix (activation-based; guides rounding within each tensor)
 ./llama-imatrix -m model-bf16.gguf -f calib.txt -o imatrix.gguf
 
 # Reference logits (the thing every candidate is compared against)
@@ -586,9 +707,9 @@ opendynamicgguf/
 ├── odg/
 │   ├── resolve.py       # any ref → original BF16 HF + architecture descriptor
 │   ├── catalog.py       # load model, state_dict enumerate, role classify, catalog JSON
-│   ├── features.py      # weight + activation stats — ranking only
+│   ├── features.py      # weight stats (from tensors) + activation stats (from calib pass)
 │   ├── ingest.py        # convert_hf_to_gguf → hashed BF16 GGUF
-│   ├── corpus.py        # corpus build, chat-template render, 3-way split
+│   ├── corpus.py        # mixed calib corpus, chat-template render, 3-way split
 │   ├── runners.py       # llama-imatrix / llama-quantize / llama-perplexity wrappers
 │   ├── sensitivity.py   # catalog features → rank → trial quant → ΔKLD/Δbytes
 │   ├── optimizer.py     # maximize bytes_saved/ΔKLD under budget → Pareto set

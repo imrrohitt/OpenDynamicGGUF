@@ -1,0 +1,68 @@
+# OpenDynamicGGUF — Step-by-step architecture
+
+This folder breaks the full pipeline into **small, teachable steps**. Read them in order the first time; later use them as a reference while implementing.
+
+Each step file answers the same questions:
+
+| Section | Meaning |
+|---|---|
+| Goal | What this step achieves |
+| Why it exists | Failure mode it prevents |
+| Inputs / Outputs | What goes in and what comes out |
+| How it works | Detailed explanation |
+| Example | Concrete walkthrough |
+| Done when | Checklist before moving on |
+| Next | Link to the following step |
+
+---
+
+## Big picture
+
+```text
+01 Resolve model ref ──────────────► original BF16 HF checkpoint
+02 Load model
+03 Enumerate tensors (state_dict)
+04 Classify roles (attn / mlp / …)
+05 Build tensor catalog
+06 Compute weight features ────────► (no text needed)
+07 Build calibration corpus ───────► calib / search / held-out
+08 Compute activation features ────► (needs calib text)
+09 Freeze BF16 GGUF
+10 Build imatrix
+11 Cache reference logits
+12 Sensitivity probe ──────────────► ΔKLD / Δbytes table
+13 Optimize recipe ────────────────► bit assignment under budget
+14 Export GGUF
+15 Validate & release
+```
+
+---
+
+## Step index
+
+| # | Step | File | One-line summary |
+|---|---|---|---|
+| 01 | Resolve model | [01-resolve-model.md](./01-resolve-model.md) | Any user ref → original BF16 safetensors |
+| 02 | Load model | [02-load-model.md](./02-load-model.md) | Load BF16 into memory with Transformers |
+| 03 | Enumerate tensors | [03-enumerate-tensors.md](./03-enumerate-tensors.md) | List every parameter via `state_dict()` |
+| 04 | Classify tensors | [04-classify-tensors.md](./04-classify-tensors.md) | Map each name → role (attn_q, ffn_up, …) |
+| 05 | Build catalog | [05-build-tensor-catalog.md](./05-build-tensor-catalog.md) | Structured inventory of all tensors |
+| 06 | Weight features | [06-compute-weight-features.md](./06-compute-weight-features.md) | Mean/var/norms from weights alone |
+| 07 | Calibration corpus | [07-build-calibration-corpus.md](./07-build-calibration-corpus.md) | Mixed text + 3-way split |
+| 08 | Activation features | [08-compute-activation-features.md](./08-compute-activation-features.md) | Run text → hidden-state stats |
+| 09 | Freeze BF16 GGUF | [09-freeze-bf16-gguf.md](./09-freeze-bf16-gguf.md) | HF → hashed BF16 GGUF for llama.cpp |
+| 10 | Build imatrix | [10-build-imatrix.md](./10-build-imatrix.md) | Activation importance for rounding |
+| 11 | Reference logits | [11-cache-reference-logits.md](./11-cache-reference-logits.md) | BF16 logits for KL comparison |
+| 12 | Sensitivity probe | [12-sensitivity-probe.md](./12-sensitivity-probe.md) | Trial-quantize groups; measure ΔKLD |
+| 13 | Optimize recipe | [13-optimize-recipe.md](./13-optimize-recipe.md) | Maximize bytes saved / ΔKLD |
+| 14 | Export GGUF | [14-export-gguf.md](./14-export-gguf.md) | Recipe → final quantized GGUF |
+| 15 | Validate & release | [15-validate-and-release.md](./15-validate-and-release.md) | Tiered gates; ship or feedback |
+
+---
+
+## Related
+
+- High-level overview: [`../../README.md`](../../README.md)
+- Interactive canvas (if present): architecture canvas in Cursor project `canvases/`
+
+**Rule to remember for every step:** statistics and features *prioritize*; measured ΔKLD *decides*; held-out validation *ships*.
