@@ -1,8 +1,12 @@
 <div align="center">
 
-<img src="docs/assets/banner.png" alt="OpenDynamicGGUF — dynamic per-tensor mixed-precision GGUF quantization for any model" width="720">
+<img src="docs/assets/logo.png" alt="OpenDynamicGGUF logo" width="160">
 
-<p><strong>An open, reproducible, measurement-driven optimizer that picks the best quantization type for every tensor group in a model — under your size or VRAM budget.</strong></p>
+# OpenDynamicGGUF
+
+**Dynamic per-tensor mixed-precision GGUF quantization — for any model.**
+
+<p>An open, reproducible, measurement-driven optimizer that picks the best quantization type for every tensor group in a model — under your size or VRAM budget.</p>
 
 <p>
   <img alt="Status: alpha" src="https://img.shields.io/badge/status-alpha-orange">
@@ -129,6 +133,9 @@ odg catalog     --model functiongemma:latest
 # 06 · weight statistics (no calibration text required)
 odg weight-features --model functiongemma:latest --only-quantizable
 
+# 07 · mixed calibration corpus, split into calib / search / held-out
+odg corpus --model functiongemma:latest --target-tokens 300000
+
 # inspect progress
 odg status --model functiongemma:latest
 odg runs
@@ -144,6 +151,8 @@ Useful flags:
 | `--prefer-hf` | For Ollama tags, use the upstream Hugging Face BF16 rather than the local GGUF |
 | `--run <id>` / `--new-run` | Resume a specific run, or force a new one |
 | `--force` | Recompute a step that is already checkpointed as done |
+| `--only-quantizable` | Skip norms and other non-quantizable tensors when computing features |
+| `--target-tokens` / `--seed` | Corpus size budget and split seed for `odg corpus` |
 | `--no-explain` | Suppress the human-readable explanation printed after each step |
 
 ---
@@ -161,8 +170,8 @@ The pipeline is split into 16 small steps, each with its own design doc. Start a
 | 04 | Classify tensors | [doc](docs/steps/04-classify-tensors.md) | `odg classify` | ✅ Implemented |
 | 05 | Build tensor catalog | [doc](docs/steps/05-build-tensor-catalog.md) | `odg catalog` | ✅ Implemented |
 | 06 | Weight features | [doc](docs/steps/06-compute-weight-features.md) | `odg weight-features` | ✅ Implemented |
-| 07 | Calibration corpus | [doc](docs/steps/07-build-calibration-corpus.md) | — | 🚧 Planned |
-| 08 | Activation features | [doc](docs/steps/08-compute-activation-features.md) | — | 🚧 Planned |
+| 07 | Calibration corpus | [doc](docs/steps/07-build-calibration-corpus.md) | `odg corpus` | ✅ Implemented |
+| 08 | Activation features | [doc](docs/steps/08-compute-activation-features.md) | `odg activation-features` | ✅ Implemented (proxy; forward optional) |
 | 09 | Freeze BF16 GGUF | [doc](docs/steps/09-freeze-bf16-gguf.md) | — | 🚧 Planned |
 | 10 | Build imatrix | [doc](docs/steps/10-build-imatrix.md) | — | 🚧 Planned |
 | 11 | Cache reference logits | [doc](docs/steps/11-cache-reference-logits.md) | — | 🚧 Planned |
@@ -829,7 +838,8 @@ OpenDynamicGGUF/
 │   ├── enumerate/           # 03 · flat inventory: name / shape / dtype / nbytes
 │   ├── classify/            # 04 · role / depth / quantizable per tensor
 │   ├── catalog/             # 05 · tensor_catalog.json — source of truth
-│   └── weight_features/     # 06 · mean / var / sparsity / outliers / norms
+│   ├── weight_features/     # 06 · mean / var / sparsity / outliers / norms
+│   └── corpus/              # 07 · mixed calibration text + 3-way split
 ├── docs/
 │   ├── assets/              # banner and diagrams
 │   └── steps/               # one design doc per pipeline step (00–15)

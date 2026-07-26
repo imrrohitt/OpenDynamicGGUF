@@ -4,10 +4,23 @@ version = "0.1.0"
 description = "Automatic per-tensor mixed-precision GGUF quantization"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
   "huggingface_hub>=0.24.0",
   "numpy>=1.26",
 ]
+
+[project.urls]
+Homepage = "https://github.com/imrrohitt/OpenDynamicGGUF"
+Documentation = "https://github.com/imrrohitt/OpenDynamicGGUF/tree/main/docs/steps"
+Issues = "https://github.com/imrrohitt/OpenDynamicGGUF/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]

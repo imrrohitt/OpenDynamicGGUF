@@ -50,7 +50,7 @@ Each step file answers the same questions:
 | 05 | Build catalog | [05-build-tensor-catalog.md](./05-build-tensor-catalog.md) | `tensor_catalog.json` source of truth |
 | 06 | Weight features | [06-compute-weight-features.md](./06-compute-weight-features.md) | `odg weight-features` — mean/var/norms + hardness |
 | 07 | Calibration corpus | [07-build-calibration-corpus.md](./07-build-calibration-corpus.md) | `odg corpus` — calib/search/heldout 60/20/20 |
-| 08 | Activation features | [08-compute-activation-features.md](./08-compute-activation-features.md) | Run text → hidden-state stats |
+| 08 | Activation features | [08-compute-activation-features.md](./08-compute-activation-features.md) | `odg activation-features` — hooks or proxy |
 | 09 | Freeze BF16 GGUF | [09-freeze-bf16-gguf.md](./09-freeze-bf16-gguf.md) | HF → hashed BF16 GGUF for llama.cpp |
 | 10 | Build imatrix | [10-build-imatrix.md](./10-build-imatrix.md) | Activation importance for rounding |
 | 11 | Reference logits | [11-cache-reference-logits.md](./11-cache-reference-logits.md) | BF16 logits for KL comparison |

@@ -129,6 +129,28 @@ def main(argv: list[str] | None = None) -> int:
     p_corp.add_argument("--seed", type=int, default=42)
     p_corp.add_argument("--no-explain", action="store_true")
 
+    # --- activation-features (step 08) ---
+    p_af = sub.add_parser(
+        "activation-features",
+        help="Step 08: activation stats from calib (forward hooks or proxy)",
+    )
+    p_af.add_argument("--model", "-m", default=None)
+    p_af.add_argument("--run", default=None)
+    p_af.add_argument("--force", action="store_true")
+    p_af.add_argument(
+        "--mode",
+        choices=("auto", "forward", "proxy"),
+        default="auto",
+        help="auto: forward if BF16+torch available, else proxy (default)",
+    )
+    p_af.add_argument(
+        "--max-docs",
+        type=int,
+        default=32,
+        help="Max calib docs for forward pass (default 32)",
+    )
+    p_af.add_argument("--no-explain", action="store_true")
+
     # --- status / runs ---
     p_status = sub.add_parser("status", help="Show checkpoint status for a run")
     p_status.add_argument("--run", default=None, help="run_id (default: latest for --model)")
@@ -152,6 +174,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_weight_features(args)
     if args.command == "corpus":
         return cmd_corpus(args)
+    if args.command == "activation-features":
+        return cmd_activation_features(args)
     if args.command == "status":
         return cmd_status(args)
     if args.command == "runs":
@@ -906,6 +930,166 @@ def cmd_corpus(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_activation_features(args: argparse.Namespace) -> int:
+    from odg.activation_features import compute_catalog_activation_features
+    from odg.store import StepAlreadyDone
+
+    print_explain = not args.no_explain
+    store = _store(args)
+
+    try:
+        meta = _require_run(store, model=args.model, run_id=args.run)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if not store.is_step_done(meta.run_id, "corpus"):
+        print(
+            "ERROR: Step 07 (corpus) is not done.\n"
+            f"  Run: odg corpus --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+    if not store.is_step_done(meta.run_id, "weight_features"):
+        print(
+            "ERROR: Step 06 (weight-features) is not done.\n"
+            f"  Run: odg weight-features --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if print_explain:
+        _banner_activation_features(meta.model_ref, meta.run_id, meta.root)
+
+    if store.is_step_done(meta.run_id, "activation_features") and not args.force:
+        out = store.read_step_output(meta.run_id, "activation_features")
+        if print_explain:
+            print("Step 08 already checkpointed as done — loading from store.")
+            print(f"  path: {store.step_path(meta.run_id, 'activation_features')}")
+            print("  (pass --force to re-run)\n")
+            print(json.dumps(out, indent=2))
+            print("\n" + store.summary(meta.run_id))
+        elif out:
+            print(json.dumps(out, indent=2))
+        return 0
+
+    catalog_path = (
+        store.step_path(meta.run_id, "weight_features") / "tensor_catalog.json"
+    )
+    if not catalog_path.is_file():
+        catalog_path = store.step_path(meta.run_id, "catalog") / "tensor_catalog.json"
+    if not catalog_path.is_file():
+        print(f"ERROR: missing catalog at {catalog_path}", file=sys.stderr)
+        return 1
+
+    calib_path = store.step_path(meta.run_id, "corpus") / "calib.txt"
+    if not calib_path.is_file():
+        print(f"ERROR: missing {calib_path}", file=sys.stderr)
+        return 1
+
+    catalog = json.loads(catalog_path.read_text())
+    resolve_out = store.read_step_output(meta.run_id, "resolve") or {}
+    corpus_out = store.read_step_output(meta.run_id, "corpus") or {}
+
+    # Prefer local HF dir if resolve downloaded BF16; else hub id
+    hf_local = None
+    local_path = resolve_out.get("local_path")
+    if local_path and Path(local_path).is_dir():
+        hf_local = local_path
+    hf_id = resolve_out.get("hf_repo_id")
+    # Don't treat Ollama blob file as HF
+    if local_path and Path(local_path).is_file():
+        hf_local = None
+
+    input_data = {
+        "from_steps": ["weight_features", "corpus"],
+        "catalog_path": str(catalog_path),
+        "calib_path": str(calib_path),
+        "mode": args.mode,
+        "max_docs": int(args.max_docs),
+        "hf_repo_id": hf_id,
+        "hf_local_path": hf_local,
+    }
+
+    try:
+        step_dir = store.begin_step(
+            meta.run_id, "activation_features", input_data, force=args.force
+        )
+    except StepAlreadyDone:
+        return cmd_activation_features(args)
+
+    try:
+        updated, result = compute_catalog_activation_features(
+            catalog,
+            calib_path=calib_path,
+            mode=args.mode,
+            hf_model_id=hf_id,
+            hf_local_path=hf_local,
+            max_forward_docs=int(args.max_docs),
+            corpus_domain_counts=corpus_out.get("domain_counts"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        store.fail_step(meta.run_id, "activation_features", str(exc))
+        print(f"\nERROR in Step 08 activation-features: {exc}", file=sys.stderr)
+        return 1
+
+    payload = {
+        "model_ref": result.model_ref,
+        "method": result.method,
+        "calib_path": result.calib_path,
+        "n_docs_used": result.n_docs_used,
+        "n_tokens_est": result.n_tokens_est,
+        "n_tensors": result.n_tensors,
+        "n_with_features": result.n_with_features,
+        "catalog_sha256": result.catalog_sha256,
+        "hardest_groups": result.hardest_groups,
+        "easiest_groups": result.easiest_groups,
+        "steps_log": result.steps_log,
+        "notes": result.notes,
+    }
+    log_text = "\n".join(result.steps_log) + "\n"
+
+    store.complete_step(
+        meta.run_id,
+        "activation_features",
+        payload,
+        log_text=log_text,
+        extra_artifacts={
+            "tensor_catalog.json": json.dumps(updated, indent=2).encode("utf-8")
+            + b"\n",
+            "activation_features.json": json.dumps(
+                {
+                    "method": result.method,
+                    "hardest_groups": result.hardest_groups,
+                    "easiest_groups": result.easiest_groups,
+                    "group_activation_features": updated.get(
+                        "group_activation_features"
+                    ),
+                },
+                indent=2,
+            ).encode("utf-8")
+            + b"\n",
+        },
+    )
+
+    if print_explain:
+        _explain_activation_features(result)
+        print("\n=== checkpoint saved ===")
+        print(f"  run_id   : {meta.run_id}")
+        print(f"  step dir : {step_dir}")
+        print(
+            "  files    : output.json, tensor_catalog.json, "
+            "activation_features.json, status.json, log.txt"
+        )
+        print("\n" + store.summary(meta.run_id))
+        print("\n=== activation-features summary (JSON) ===")
+        print(json.dumps(payload, indent=2))
+    else:
+        print(json.dumps(payload, indent=2))
+
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     store = _store(args)
     if args.run:
@@ -1176,6 +1360,66 @@ def _explain_corpus(result) -> None:
 
     print("\n=== next ===")
     print("  Step 08 — activation features (needs calib.txt + a forward pass).")
+
+
+def _banner_activation_features(model: str, run_id: str, root: str) -> None:
+    print(
+        """
+╔══════════════════════════════════════════════════════════════╗
+║  OpenDynamicGGUF — Step 08: Activation features             ║
+╚══════════════════════════════════════════════════════════════╝
+""".rstrip()
+    )
+    print(
+        f"""
+What this step does
+-------------------
+  Input : calib.txt + catalog (weight_features) + optional BF16 HF model
+  Model : {model}
+  Goal  : Per-tensor activation range / outliers for probe ranking.
+          Prefer real forward hooks; proxy_from_weights if no BF16.
+
+  Checkpoint
+  ----------
+  run_id : {run_id}
+  root   : {root}
+""".rstrip()
+    )
+
+
+def _explain_activation_features(result) -> None:
+    print("\n=== what happened ===")
+    for line in result.steps_log:
+        print(f"  • {line}")
+
+    print("\n=== verdict ===")
+    print(f"  ✓ Method            : {result.method}")
+    print(f"  ✓ Features filled   : {result.n_with_features}/{result.n_tensors}")
+    print(f"  ✓ Calib docs used   : {result.n_docs_used} (tokens_est≈{result.n_tokens_est})")
+    print(f"  ✓ catalog_sha256    : {result.catalog_sha256[:24]}…")
+
+    print("\n=== hardest groups (activation) ===")
+    for g in result.hardest_groups[:5]:
+        print(
+            f"  {g['group_id']:<22} hardness={g.get('hardness', 0):.4f} "
+            f"absmax={g.get('absmax', 0):.4f} "
+            f"outlier={g.get('outlier_ratio', 0):.4f}"
+        )
+
+    print("\n=== easiest groups ===")
+    for g in result.easiest_groups[:5]:
+        print(
+            f"  {g['group_id']:<22} hardness={g.get('hardness', 0):.4f} "
+            f"absmax={g.get('absmax', 0):.4f}"
+        )
+
+    if result.notes:
+        print("\n=== notes ===")
+        for n in result.notes:
+            print(f"  • {n}")
+
+    print("\n=== next ===")
+    print("  Step 09 — freeze BF16 GGUF for llama.cpp (imatrix / probes).")
 
 
 def _banner_classify(model: str, run_id: str, root: str) -> None:
