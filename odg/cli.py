@@ -28,7 +28,18 @@ def main(argv: list[str] | None = None) -> int:
     p_resolve.add_argument(
         "--download-weights",
         action="store_true",
-        help="Also download the HF BF16 safetensors snapshot (needs Hub auth if gated)",
+        help="With --prefer-hf: download the HF BF16 safetensors snapshot",
+    )
+    p_resolve.add_argument(
+        "--prefer-hf",
+        action="store_true",
+        help="For Ollama tags: use Hugging Face BF16 instead of the local Ollama GGUF",
+    )
+    p_resolve.add_argument(
+        "--from-ollama",
+        action="store_true",
+        default=True,
+        help="For Ollama tags: use local Ollama GGUF (default)",
     )
     p_resolve.add_argument(
         "--out",
@@ -76,6 +87,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             args.model,
             cache_dir=args.cache_dir,
             download_weights=args.download_weights,
+            prefer_hf=args.prefer_hf,
         )
     except Exception as exc:  # noqa: BLE001
         print(f"\nERROR in Step 01 resolve: {exc}", file=sys.stderr)
@@ -110,7 +122,7 @@ def _banner(model: str) -> None:
     print(
         """
 ╔══════════════════════════════════════════════════════════════╗
-║  OpenDynamicGGUF — Step 01: Resolve model to original BF16  ║
+║  OpenDynamicGGUF — Step 01: Resolve model                   ║
 ╚══════════════════════════════════════════════════════════════╝
 """.rstrip()
     )
@@ -119,10 +131,8 @@ def _banner(model: str) -> None:
 What this step does
 -------------------
   Input : {model}
-  Goal  : Find the ORIGINAL full-precision (BF16/F16) weights.
-
-  Why   : Ollama/MLX copies are often already quantized (Q4/Q8/…).
-          Re-quantizing them stacks error. We always go back to HF BF16.
+  Mode  : Ollama tags → use LOCAL Ollama GGUF by default (no HF login).
+          Pass --prefer-hf later for original BF16 from Hugging Face.
 
   This step does NOT load the neural net and does NOT quantize.
 """.rstrip()
@@ -135,13 +145,13 @@ def _explain(result) -> None:
         print(f"  • {line}")
 
     print("\n=== verdict ===")
+    print(f"  ✓ Kind                : {result.kind.value}")
+    print(f"  ✓ Working local_path  : {result.local_path}")
+    print(f"  ✓ Weights ready       : {result.weights_ready}")
+    print(f"  ✓ Source quantized?   : {result.source_is_quantized}")
+    print(f"  ✓ Upstream HF (later) : {result.hf_repo_id}")
     if result.rejected_quantized_source:
-        print("  ✗ Rejected quantized local artifact as a quantization source.")
-        print(f"    {result.rejected_quantized_source}")
-    print(f"  ✓ Kind           : {result.kind.value}")
-    print(f"  ✓ Upstream HF    : {result.hf_repo_id}")
-    print(f"  ✓ Local path     : {result.local_path}")
-    print(f"  ✓ Weights ready  : {result.weights_ready}")
+        print(f"  · Note: {result.rejected_quantized_source}")
 
     d = result.descriptor
     print("\n=== architecture descriptor ===")
@@ -158,17 +168,18 @@ def _explain(result) -> None:
             print(f"    - {n}")
 
     print("\n=== next ===")
-    if not result.weights_ready:
-        print(
-            "  BF16 weights are not on disk yet (common for gated Gemma models).\n"
-            "  1. Accept the license on the HF model page\n"
-            "  2. huggingface-cli login\n"
-            "  3. odg resolve --model "
-            f"{result.user_ref} --download-weights\n"
-            "  Then continue to Step 02 (load model)."
-        )
+    if result.weights_ready and result.local_path:
+        print("  Local weights ready → proceed to Step 02 (inspect / catalog).")
+        if result.source_is_quantized:
+            print(
+                "  Warning: source is already quantized. Fine for pipeline plumbing;\n"
+                "  for real dynamic quant quality, later switch to --prefer-hf BF16."
+            )
     else:
-        print("  Weights ready → proceed to Step 02 (load model into memory).")
+        print(
+            "  Weights not ready. For Ollama tags, re-run without --prefer-hf,\n"
+            "  or login to Hugging Face and use --prefer-hf --download-weights."
+        )
 
 
 if __name__ == "__main__":

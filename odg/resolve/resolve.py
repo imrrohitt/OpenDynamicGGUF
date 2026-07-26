@@ -1,13 +1,12 @@
 """
-Step 01 — Resolve any user model reference to the original BF16 source.
+Step 01 — Resolve any user model reference.
 
-What this module does (and does NOT do):
-  ✓ Classifies the reference (HF / Ollama / MLX / local)
-  ✓ For Ollama/MLX: refuses quantized blobs as quantization sources
-  ✓ Maps to the upstream Hugging Face full-precision repo
-  ✓ Builds an ArchitectureDescriptor (family, layers, specialty, …)
-  ✗ Does NOT load weights into a neural net (that's Step 02)
-  ✗ Does NOT quantize anything
+Default for Ollama tags (current workflow):
+  Use the local Ollama GGUF as the working source so you can proceed
+  without Hugging Face login.
+
+Ideal production path (later / --prefer-hf):
+  Map Ollama → original BF16 Hugging Face repo and download that.
 """
 
 from __future__ import annotations
@@ -27,20 +26,20 @@ def resolve_model(
     *,
     cache_dir: str | Path | None = None,
     download_weights: bool = False,
+    prefer_hf: bool = False,
     hf_token: str | None = None,
     ollama_root: str | Path | None = None,
 ) -> ResolvedModel:
     """
-    Resolve ``user_ref`` to a full-precision source identity + descriptor.
+    Resolve ``user_ref``.
 
     Parameters
     ----------
-    user_ref:
-        e.g. ``functiongemma:latest``, ``google/gemma-3-270m-it``, ``./my-model``
+    prefer_hf:
+        If True (and kind is Ollama), try Hugging Face BF16 instead of the
+        local Ollama blob. Default False = use Ollama locally right now.
     download_weights:
-        If True, attempt to download the HF safetensors snapshot.
-        Default False keeps Step 01 fast and works even when only mapping
-        Ollama → HF id (gated models still need login for download).
+        Only used with prefer_hf / HF refs — download safetensors snapshot.
     """
     log: list[str] = []
     cache = Path(cache_dir or (Path.home() / ".cache" / "odg" / "models"))
@@ -57,10 +56,15 @@ def resolve_model(
 
     if kind == SourceKind.OLLAMA:
         return _resolve_ollama(
-            user_ref, log, cache, download_weights, hf_token, ollama_root
+            user_ref,
+            log,
+            cache,
+            download_weights=download_weights,
+            prefer_hf=prefer_hf,
+            hf_token=hf_token,
+            ollama_root=ollama_root,
         )
 
-    # HF
     return _resolve_hf(user_ref, log, cache, download_weights, hf_token)
 
 
@@ -71,7 +75,7 @@ def _resolve_local(user_ref: str, log: list[str]) -> ResolvedModel:
     if not full_prec:
         raise ValueError(
             f"Local path {path} looks quantized (quantization_config present). "
-            "Step 01 requires original BF16/F16 weights."
+            "Pass a full-precision checkpoint, or use an Ollama tag."
         )
     log.append("3. Local checkpoint looks full-precision — using as source")
     return ResolvedModel(
@@ -82,6 +86,7 @@ def _resolve_local(user_ref: str, log: list[str]) -> ResolvedModel:
         weights_ready=True,
         source_sha256=None,
         descriptor=desc,
+        source_is_quantized=False,
         steps_log=log,
     )
 
@@ -123,7 +128,9 @@ def _resolve_ollama(
     user_ref: str,
     log: list[str],
     cache: Path,
+    *,
     download_weights: bool,
+    prefer_hf: bool,
     hf_token: str | None,
     ollama_root: str | Path | None,
 ) -> ResolvedModel:
@@ -137,31 +144,20 @@ def _resolve_ollama(
         f"parameters={info.parameter_count}"
     )
 
-    rejected = None
-    if info.is_quantized:
-        rejected = (
-            f"Ollama blob for {tag} is quantized ({info.quantization}). "
-            "Using it as a quantization source would stack quantization error. "
-            "We resolve the original BF16 Hugging Face checkpoint instead."
+    if not info.model_blob_path or not info.model_blob_path.is_file():
+        raise FileNotFoundError(
+            f"Ollama model blob for {tag!r} not found on disk. "
+            f"Run: ollama pull {tag}"
         )
-        log.append(f"4. REJECTED quantized Ollama blob as source — {rejected}")
-        if info.model_blob_path:
-            log.append(f"   (ignored blob: {info.model_blob_path})")
-    else:
-        log.append("4. Ollama blob appears full-precision (unusual); still prefer HF source")
 
     hf_id = info.upstream_hf or lookup_ollama_hf(tag)
-    if not hf_id:
-        raise ValueError(
-            f"Could not map Ollama tag {tag!r} to an upstream HF repo. "
-            "Add it to odg.resolve.maps.OLLAMA_TO_HF or pass the HF id directly."
-        )
-    log.append(f"5. Upstream full-precision HF repo: {hf_id}")
 
     specialty = None
+    step_n = 4
     if "tools" in info.capabilities or "function" in tag.lower():
         specialty = "function_calling"
-        log.append("6. Detected tool/function-calling specialty domain")
+        log.append(f"{step_n}. Detected tool/function-calling specialty domain")
+        step_n += 1
 
     base = ArchitectureDescriptor(
         family=(info.architecture or "").lower() or None,
@@ -172,14 +168,59 @@ def _resolve_ollama(
         chat_template=(info.architecture or "").lower() or None,
         specialty_domain=specialty,
         ollama_quantization=info.quantization,
-        notes=[rejected] if rejected else [],
+        notes=[],
     )
     if info.layer_count:
         log.append(
-            f"7. Enriched descriptor from GGUF metadata: "
+            f"{step_n}. Enriched descriptor from GGUF metadata: "
             f"layers={info.layer_count}, embed={info.embedding_length}"
         )
+        step_n += 1
 
+    # --- Default path: use local Ollama GGUF ---
+    if not prefer_hf:
+        note = (
+            f"Using local Ollama GGUF as working source "
+            f"(quant={info.quantization}). "
+            "Ideal later path is BF16 from Hugging Face "
+            f"({hf_id or 'unknown'}); pass --prefer-hf when ready."
+        )
+        base.notes.append(note)
+        log.append(f"{step_n}. USING Ollama blob as local_path: {info.model_blob_path}")
+        step_n += 1
+        log.append(f"{step_n}. {note}")
+        step_n += 1
+        if hf_id:
+            log.append(f"{step_n}. Recorded upstream HF (for later): {hf_id}")
+
+        return ResolvedModel(
+            user_ref=user_ref,
+            kind=SourceKind.OLLAMA,
+            hf_repo_id=hf_id,
+            local_path=str(info.model_blob_path),
+            weights_ready=True,
+            source_sha256=None,
+            descriptor=base,
+            source_is_quantized=bool(info.is_quantized),
+            rejected_quantized_source=None,
+            steps_log=log,
+        )
+
+    # --- Optional: prefer Hugging Face BF16 ---
+    if not hf_id:
+        raise ValueError(
+            f"Could not map Ollama tag {tag!r} to an upstream HF repo. "
+            "Add it to odg.resolve.maps.OLLAMA_TO_HF or pass the HF id directly."
+        )
+    rejected = None
+    if info.is_quantized:
+        rejected = (
+            f"Ollama blob for {tag} is quantized ({info.quantization}). "
+            "--prefer-hf is set, so we use Hugging Face BF16 instead of the blob."
+        )
+        log.append(f"{step_n}. Prefer HF: skipping quantized Ollama blob — {rejected}")
+        step_n += 1
+    log.append(f"{step_n}. Upstream full-precision HF repo: {hf_id}")
     return _finish_hf(
         user_ref=user_ref,
         kind=SourceKind.OLLAMA,
@@ -229,7 +270,6 @@ def _finish_hf(
     specialty_hint: str | None,
     base_desc: ArchitectureDescriptor,
 ) -> ResolvedModel:
-    # Try to enrich from HF config when possible.
     try:
         cfg = fetch_hf_config(hf_id, token=hf_token)
         hf_desc = descriptor_from_hf_config(cfg, hf_id, specialty_hint)
@@ -241,7 +281,6 @@ def _finish_hf(
         if specialty_hint and not desc.specialty_domain:
             desc.specialty_domain = specialty_hint
         if not desc.family and "/" in hf_id:
-            # weak fallback from repo name
             desc.family = hf_id.split("/", 1)[1].split("-")[0].lower()
 
     local_path, weights_ready, err, notes = try_prepare_hf_weights(
@@ -269,6 +308,7 @@ def _finish_hf(
         weights_ready=weights_ready,
         source_sha256=None,
         descriptor=desc,
+        source_is_quantized=False,
         rejected_quantized_source=rejected,
         steps_log=log,
     )

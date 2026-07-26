@@ -42,11 +42,13 @@ class ResolvedModel:
     """
     Result of Step 01.
 
-    Important:
-      - ``hf_repo_id`` / ``local_path`` point at the *original full-precision*
-        source we should quantize FROM.
-      - ``rejected_quantized_source`` explains why an Ollama/MLX blob was not used.
-      - Weights may not be downloaded yet (gated HF repos need login).
+    For Ollama (default right now):
+      - ``local_path`` is the local Ollama GGUF blob
+      - ``source_is_quantized`` is True if that blob is Q4/Q8/…
+      - ``hf_repo_id`` is still recorded as the ideal BF16 upstream for later
+
+    For HF / local BF16:
+      - ``local_path`` points at full-precision weights when available
     """
 
     user_ref: str
@@ -56,6 +58,7 @@ class ResolvedModel:
     weights_ready: bool
     source_sha256: str | None
     descriptor: ArchitectureDescriptor
+    source_is_quantized: bool = False
     rejected_quantized_source: str | None = None
     steps_log: list[str] = field(default_factory=list)
 
@@ -67,6 +70,7 @@ class ResolvedModel:
             "local_path": self.local_path,
             "weights_ready": self.weights_ready,
             "source_sha256": self.source_sha256,
+            "source_is_quantized": self.source_is_quantized,
             "rejected_quantized_source": self.rejected_quantized_source,
             "descriptor": self.descriptor.to_dict(),
             "steps_log": self.steps_log,
