@@ -179,8 +179,8 @@ The pipeline is split into 16 small steps, each with its own design doc. Start a
 | 08 | Activation features | [doc](docs/steps/08-compute-activation-features.md) | `odg activation-features` | ✅ Implemented (proxy; forward optional) |
 | 09 | Freeze BF16 GGUF | [doc](docs/steps/09-freeze-bf16-gguf.md) | `odg freeze-gguf` | ✅ Implemented (promote; HF convert optional) |
 | 10 | Build imatrix | [doc](docs/steps/10-build-imatrix.md) | `odg imatrix` | ✅ Implemented (proxy; llama-imatrix optional) |
-| 11 | Cache reference logits | [doc](docs/steps/11-cache-reference-logits.md) | — | 🚧 Planned |
-| 12 | Sensitivity probe | [doc](docs/steps/12-sensitivity-probe.md) | — | 🚧 Planned |
+| 11 | Cache reference logits | [doc](docs/steps/11-cache-reference-logits.md) | `odg reference-logits` | ✅ Implemented (proxy; llama-perplexity optional) |
+| 12 | Sensitivity probe | [doc](docs/steps/12-sensitivity-probe.md) | `odg sensitivity` | ✅ Implemented (proxy table; llama probes TBD) |
 | 13 | Optimize recipe | [doc](docs/steps/13-optimize-recipe.md) | — | 🚧 Planned |
 | 14 | Export GGUF | [doc](docs/steps/14-export-gguf.md) | — | 🚧 Planned |
 | 15 | Validate & release | [doc](docs/steps/15-validate-and-release.md) | — | 🚧 Planned |

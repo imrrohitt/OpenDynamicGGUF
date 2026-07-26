@@ -206,6 +206,49 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_im.add_argument("--no-explain", action="store_true")
 
+    # --- reference-logits (step 11) ---
+    p_lg = sub.add_parser(
+        "reference-logits",
+        help="Step 11: cache search/heldout reference logits for KL divergence",
+    )
+    p_lg.add_argument("--model", "-m", default=None)
+    p_lg.add_argument("--run", default=None)
+    p_lg.add_argument("--force", action="store_true")
+    p_lg.add_argument(
+        "--mode",
+        choices=("auto", "llama", "proxy"),
+        default="auto",
+        help="auto: llama-perplexity if found, else proxy manifest",
+    )
+    p_lg.add_argument(
+        "--llama-perplexity",
+        type=Path,
+        default=None,
+        help="Path to llama-perplexity (or set LLAMA_CPP_DIR)",
+    )
+    p_lg.add_argument("--no-explain", action="store_true")
+
+    # --- sensitivity (step 12) ---
+    p_sens = sub.add_parser(
+        "sensitivity",
+        help="Step 12: probe groups → Δbytes/ΔKLD sensitivity table",
+    )
+    p_sens.add_argument("--model", "-m", default=None)
+    p_sens.add_argument("--run", default=None)
+    p_sens.add_argument("--force", action="store_true")
+    p_sens.add_argument(
+        "--mode",
+        choices=("auto", "llama", "proxy"),
+        default="auto",
+        help="auto/proxy: feature-estimated table; llama: real trial quant (needs tools)",
+    )
+    p_sens.add_argument(
+        "--baseline",
+        default="Q6_K",
+        help="Baseline type for Δbytes (default Q6_K)",
+    )
+    p_sens.add_argument("--no-explain", action="store_true")
+
     # --- status / runs ---
     p_status = sub.add_parser("status", help="Show checkpoint status for a run")
     p_status.add_argument("--run", default=None, help="run_id (default: latest for --model)")
@@ -235,6 +278,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_freeze_gguf(args)
     if args.command == "imatrix":
         return cmd_imatrix(args)
+    if args.command == "reference-logits":
+        return cmd_reference_logits(args)
+    if args.command == "sensitivity":
+        return cmd_sensitivity(args)
     if args.command == "status":
         return cmd_status(args)
     if args.command == "runs":
@@ -1418,6 +1465,251 @@ def cmd_imatrix(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reference_logits(args: argparse.Namespace) -> int:
+    from odg.logits import cache_reference_logits
+    from odg.store import StepAlreadyDone
+
+    print_explain = not args.no_explain
+    store = _store(args)
+
+    try:
+        meta = _require_run(store, model=args.model, run_id=args.run)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if not store.is_step_done(meta.run_id, "imatrix"):
+        print(
+            "ERROR: Step 10 (imatrix) is not done.\n"
+            f"  Run: odg imatrix --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+    if not store.is_step_done(meta.run_id, "freeze_gguf"):
+        print(
+            "ERROR: Step 09 (freeze-gguf) is not done.\n"
+            f"  Run: odg freeze-gguf --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+    if not store.is_step_done(meta.run_id, "corpus"):
+        print(
+            "ERROR: Step 07 (corpus) is not done.\n"
+            f"  Run: odg corpus --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if print_explain:
+        _banner_reference_logits(meta.model_ref, meta.run_id, meta.root)
+
+    if store.is_step_done(meta.run_id, "reference_logits") and not args.force:
+        out = store.read_step_output(meta.run_id, "reference_logits")
+        if print_explain:
+            print("Step 11 already checkpointed as done — loading from store.")
+            print(f"  path: {store.step_path(meta.run_id, 'reference_logits')}")
+            print("  (pass --force to re-run)\n")
+            print(json.dumps(out, indent=2))
+            print("\n" + store.summary(meta.run_id))
+        elif out:
+            print(json.dumps(out, indent=2))
+        return 0
+
+    freeze_out = store.read_step_output(meta.run_id, "freeze_gguf") or {}
+    gguf_path = freeze_out.get("gguf_path")
+    if not gguf_path or not Path(gguf_path).is_file():
+        step9 = store.step_path(meta.run_id, "freeze_gguf")
+        for name in ("model-bf16.gguf", "model-ref.gguf"):
+            cand = step9 / name
+            if cand.is_file():
+                gguf_path = str(cand)
+                break
+    if not gguf_path:
+        print("ERROR: frozen GGUF path missing from Step 09", file=sys.stderr)
+        return 1
+
+    corpus_dir = store.step_path(meta.run_id, "corpus")
+    search_path = corpus_dir / "search.txt"
+    heldout_path = corpus_dir / "heldout.txt"
+    if not search_path.is_file() or not heldout_path.is_file():
+        print(
+            f"ERROR: need {search_path} and {heldout_path}",
+            file=sys.stderr,
+        )
+        return 1
+
+    input_data = {
+        "from_steps": ["freeze_gguf", "corpus", "imatrix"],
+        "gguf_path": gguf_path,
+        "gguf_sha256": freeze_out.get("gguf_sha256"),
+        "search_path": str(search_path),
+        "heldout_path": str(heldout_path),
+        "mode": args.mode,
+    }
+
+    try:
+        step_dir = store.begin_step(
+            meta.run_id, "reference_logits", input_data, force=args.force
+        )
+    except StepAlreadyDone:
+        return cmd_reference_logits(args)
+
+    try:
+        result = cache_reference_logits(
+            model_ref=meta.model_ref,
+            out_dir=step_dir,
+            gguf_path=gguf_path,
+            search_path=search_path,
+            heldout_path=heldout_path,
+            gguf_sha256=freeze_out.get("gguf_sha256"),
+            mode=args.mode,
+            llama_perplexity=args.llama_perplexity,
+        )
+    except Exception as exc:  # noqa: BLE001
+        store.fail_step(meta.run_id, "reference_logits", str(exc))
+        print(f"\nERROR in Step 11 reference-logits: {exc}", file=sys.stderr)
+        return 1
+
+    payload = result.summary_dict()
+    log_text = "\n".join(result.steps_log) + "\n"
+
+    store.complete_step(
+        meta.run_id,
+        "reference_logits",
+        payload,
+        log_text=log_text,
+    )
+
+    if print_explain:
+        _explain_reference_logits(result)
+        print("\n=== checkpoint saved ===")
+        print(f"  run_id   : {meta.run_id}")
+        print(f"  step dir : {step_dir}")
+        print(
+            "  files    : output.json, logits_manifest.json, "
+            "logits-*.bin|MISSING, status.json, log.txt"
+        )
+        print("\n" + store.summary(meta.run_id))
+        print("\n=== reference-logits summary (JSON) ===")
+        print(json.dumps(payload, indent=2))
+    else:
+        print(json.dumps(payload, indent=2))
+
+    return 0
+
+
+def cmd_sensitivity(args: argparse.Namespace) -> int:
+    from odg.sensitivity import build_sensitivity_table
+    from odg.store import StepAlreadyDone
+
+    print_explain = not args.no_explain
+    store = _store(args)
+
+    try:
+        meta = _require_run(store, model=args.model, run_id=args.run)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if not store.is_step_done(meta.run_id, "reference_logits"):
+        print(
+            "ERROR: Step 11 (reference-logits) is not done.\n"
+            f"  Run: odg reference-logits --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if print_explain:
+        _banner_sensitivity(meta.model_ref, meta.run_id, meta.root)
+
+    if store.is_step_done(meta.run_id, "sensitivity") and not args.force:
+        out = store.read_step_output(meta.run_id, "sensitivity")
+        if print_explain:
+            print("Step 12 already checkpointed as done — loading from store.")
+            print(f"  path: {store.step_path(meta.run_id, 'sensitivity')}")
+            print("  (pass --force to re-run)\n")
+            print(json.dumps(out, indent=2))
+            print("\n" + store.summary(meta.run_id))
+        elif out:
+            print(json.dumps(out, indent=2))
+        return 0
+
+    catalog = None
+    for step_id in ("activation_features", "weight_features", "catalog"):
+        cpath = store.step_path(meta.run_id, step_id) / "tensor_catalog.json"
+        if cpath.is_file():
+            catalog = json.loads(cpath.read_text())
+            break
+    if not catalog:
+        print("ERROR: tensor_catalog.json not found", file=sys.stderr)
+        return 1
+
+    freeze_out = store.read_step_output(meta.run_id, "freeze_gguf") or {}
+    search_path = store.step_path(meta.run_id, "corpus") / "search.txt"
+    imatrix_proxy = store.step_path(meta.run_id, "imatrix") / "imatrix_proxy.json"
+
+    # Prefer proxy mode when llama requested but unavailable path
+    mode = args.mode
+    if mode == "auto":
+        mode = "proxy"
+
+    input_data = {
+        "from_steps": ["reference_logits", "imatrix", "corpus"],
+        "mode": mode,
+        "baseline": args.baseline,
+        "gguf_sha256": freeze_out.get("gguf_sha256"),
+        "search_path": str(search_path),
+        "n_catalog_groups": len(catalog.get("groups") or {}),
+    }
+
+    try:
+        step_dir = store.begin_step(
+            meta.run_id, "sensitivity", input_data, force=args.force
+        )
+    except StepAlreadyDone:
+        return cmd_sensitivity(args)
+
+    try:
+        result, _rows = build_sensitivity_table(
+            model_ref=meta.model_ref,
+            out_dir=step_dir,
+            catalog=catalog,
+            gguf_sha256=freeze_out.get("gguf_sha256"),
+            search_path=search_path if search_path.is_file() else None,
+            imatrix_proxy_path=imatrix_proxy if imatrix_proxy.is_file() else None,
+            mode=mode,
+            baseline_type=args.baseline,
+        )
+    except Exception as exc:  # noqa: BLE001
+        store.fail_step(meta.run_id, "sensitivity", str(exc))
+        print(f"\nERROR in Step 12 sensitivity: {exc}", file=sys.stderr)
+        return 1
+
+    payload = result.summary_dict()
+    log_text = "\n".join(result.steps_log) + "\n"
+
+    store.complete_step(
+        meta.run_id,
+        "sensitivity",
+        payload,
+        log_text=log_text,
+    )
+
+    if print_explain:
+        _explain_sensitivity(result)
+        print("\n=== checkpoint saved ===")
+        print(f"  run_id   : {meta.run_id}")
+        print(f"  step dir : {step_dir}")
+        print("  files    : output.json, sensitivity.json, status.json, log.txt")
+        print("\n" + store.summary(meta.run_id))
+        print("\n=== sensitivity summary (JSON) ===")
+        print(json.dumps(payload, indent=2))
+    else:
+        print(json.dumps(payload, indent=2))
+
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     store = _store(args)
     if args.run:
@@ -1845,6 +2137,112 @@ def _explain_imatrix(result) -> None:
 
     print("\n=== next ===")
     print("  Step 11 — cache reference logits on search/heldout splits.")
+
+
+def _banner_reference_logits(model: str, run_id: str, root: str) -> None:
+    print(
+        """
+╔══════════════════════════════════════════════════════════════╗
+║  OpenDynamicGGUF — Step 11: Reference logits                ║
+╚══════════════════════════════════════════════════════════════╝
+""".rstrip()
+    )
+    print(
+        f"""
+What this step does
+-------------------
+  Input : frozen GGUF + search.txt + heldout.txt (never calib)
+  Model : {model}
+  Goal  : Cache P_ref logits so every candidate can be scored with
+          KL(P_ref ‖ P_quant) without re-running the reference model.
+
+  Checkpoint
+  ----------
+  run_id : {run_id}
+  root   : {root}
+""".rstrip()
+    )
+
+
+def _explain_reference_logits(result) -> None:
+    print("\n=== what happened ===")
+    for line in result.steps_log:
+        print(f"  • {line}")
+
+    print("\n=== verdict ===")
+    print(f"  ✓ Method            : {result.method}")
+    print(f"  ✓ cache_key         : {result.cache_key[:32]}…")
+    print(f"  ✓ logits-search     : {result.logits_search_path or '(missing)'}")
+    print(f"  ✓ logits-heldout    : {result.logits_heldout_path or '(missing)'}")
+
+    if result.notes:
+        print("\n=== notes ===")
+        for n in result.notes:
+            print(f"  • {n}")
+
+    print("\n=== next ===")
+    print("  Step 12 — sensitivity probe (trial-quantize groups; measure ΔKLD).")
+
+
+def _banner_sensitivity(model: str, run_id: str, root: str) -> None:
+    print(
+        """
+╔══════════════════════════════════════════════════════════════╗
+║  OpenDynamicGGUF — Step 12: Sensitivity probe               ║
+╚══════════════════════════════════════════════════════════════╝
+""".rstrip()
+    )
+    print(
+        f"""
+What this step does
+-------------------
+  Input : catalog + features + imatrix proxy + search split
+  Model : {model}
+  Goal  : For each group × quant type, estimate/measure
+          (Δbytes, ΔKLD) — the table Step 13 optimizes over.
+          Features prioritize; probes decide (when llama tools exist).
+
+  Checkpoint
+  ----------
+  run_id : {run_id}
+  root   : {root}
+""".rstrip()
+    )
+
+
+def _explain_sensitivity(result) -> None:
+    print("\n=== what happened ===")
+    for line in result.steps_log:
+        print(f"  • {line}")
+
+    print("\n=== verdict ===")
+    print(f"  ✓ Method            : {result.method}")
+    print(f"  ✓ Groups probed     : {result.n_groups_probed}")
+    print(f"  ✓ Table rows        : {result.n_rows}")
+    print(f"  ✓ Baseline / probes : {result.baseline_type} / {result.probe_types}")
+
+    print("\n=== best efficiency (bytes_saved / ΔKLD) ===")
+    for r in result.top_efficiency[:6]:
+        print(
+            f"  {r['group_id']:<20} {r['probe']:<6} "
+            f"ΔB={r['delta_bytes']:>10}  ΔKLD={r['delta_kld']:.4f}  "
+            f"eff={r['efficiency']:.2e}  {r['decision_hint']}"
+        )
+
+    if result.pinned_hints:
+        print("\n=== pin-high hints (sensitive @ Q4) ===")
+        for r in result.pinned_hints[:5]:
+            print(
+                f"  {r['group_id']:<20} ΔKLD={r['delta_kld']:.4f}"
+            )
+
+    if result.notes:
+        print("\n=== notes ===")
+        for n in result.notes:
+            print(f"  • {n}")
+
+    print("\n=== next ===")
+    print("  Step 13 — optimize recipe (maximize bytes saved / ΔKLD under budget).")
 
 
 def _banner_classify(model: str, run_id: str, root: str) -> None:

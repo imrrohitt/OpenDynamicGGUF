@@ -1,4 +1,4 @@
-# Step 11 — Cache BF16 reference logits
+# Step 11 — Cache reference logits
 
 ← [10 Imatrix](./10-build-imatrix.md) · [Index](./README.md) · Next: [12 Probe](./12-sensitivity-probe.md) →
 
@@ -6,76 +6,51 @@
 
 ## Goal
 
-Run the BF16 GGUF once on **search** and **held-out** text and save logit distributions. Every quantized candidate will be compared to these caches via KL divergence — without re-running BF16 each time.
+Run the reference GGUF once on **search** and **held-out** text and save logit distributions. Every quantized candidate is compared to these caches via KL divergence — without re-running the reference each time.
 
 ---
 
-## Why it exists
-
-ΔKLD needs:
-
-```text
-KL( P_BF16  ‖  P_quant )
-```
-
-Computing `P_BF16` is expensive. Cache it.
-
----
-
-## Inputs / Outputs
-
-| | |
-|---|---|
-| **Input** | `model-bf16.gguf` + `search.txt` + `heldout.txt` |
-| **Output** | `logits-search.bin`, `logits-heldout.bin` |
-
----
-
-## How it works
+## Command
 
 ```bash
-# Search split — used during probing / optimization
-./llama-perplexity \
-  -m model-bf16.gguf \
-  -f search.txt \
-  --kl-divergence-base logits-search.bin
+odg reference-logits --model functiongemma:latest
 
-# Held-out — used ONLY in validation (Step 15)
-./llama-perplexity \
-  -m model-bf16.gguf \
-  -f heldout.txt \
-  --kl-divergence-base logits-heldout.bin
+# require real caches:
+export LLAMA_CPP_DIR=~/llama.cpp
+odg reference-logits --model functiongemma:latest --mode llama --force
 ```
 
-(Exact flags can vary by llama.cpp version — wrap in `runners.py`.)
-
-Later, for a candidate:
-
-```bash
-./llama-perplexity \
-  -m candidate.gguf \
-  --kl-divergence-base logits-search.bin \
-  --kl-divergence
-```
+Requires Steps 07 + 09 + 10. Uses `search.txt` + `heldout.txt` only — **never calib**.
 
 ---
 
-## Example
+## Outputs
 
 ```text
-search.txt     → logits-search.bin     (optimizer objective)
-heldout.txt    → logits-heldout.bin    (Tier-1 gate only)
+steps/11_reference_logits/
+  logits-search.bin           # when llama-perplexity succeeds
+  logits-heldout.bin
+  logits-*.bin.MISSING        # markers in proxy mode
+  logits_manifest.json        # cache_key = hash(gguf, search, heldout)
+  output.json
+  status.json
+  log.txt
+```
 
-Cache key includes: bf16_sha + corpus_sha + llama.cpp version
+Later probe:
+
+```bash
+llama-perplexity -m candidate.gguf \
+  --kl-divergence-base logits-search.bin --kl-divergence
 ```
 
 ---
 
 ## Done when
 
-- [ ] Both logit caches exist
-- [ ] Search cache never mixed with held-out
-- [ ] Cached under content-addressed store
+- [x] Manifest + cache_key recorded
+- [x] Search / heldout kept separate
+- [x] Real `.bin` caches **or** documented MISSING markers
 
 ## Next
 
