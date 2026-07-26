@@ -1,4 +1,4 @@
-# Step 02 — Load the BF16 model into memory
+# Step 02 — Load the model
 
 ← [01 Resolve](./01-resolve-model.md) · [Index](./README.md) · Next: [03 Enumerate](./03-enumerate-tensors.md) →
 
@@ -6,13 +6,13 @@
 
 ## Goal
 
-Load the resolved checkpoint so every parameter tensor is available in memory (or memory-mapped) for inspection.
+Open the source from Step 01 and make its tensors **addressable** for later inspection (enumerate / features).
 
 ---
 
 ## Why it exists
 
-Later steps need to **walk every weight**, classify it, and compute statistics. That requires a real `nn.Module` (or equivalent safetensors iterator), not just a GGUF file.
+Step 01 only finds the file. Step 02 proves we can open it and builds the tensor index.
 
 ---
 
@@ -20,64 +20,58 @@ Later steps need to **walk every weight**, classify it, and compute statistics. 
 
 | | |
 |---|---|
-| **Input** | Path / HF id from Step 01 |
-| **Output** | Loaded `model` object in BF16 |
+| **Input** | `01_resolve/output.json` → `local_path` |
+| **Output** | `02_load/output.json` + `tensor_index.json` |
 
 ---
 
-## How it works
+## Two backends
 
-```python
-from transformers import AutoModelForCausalLM
-import torch
-
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_PATH,                  # from resolver — never an MLX/Ollama quant
-    torch_dtype=torch.bfloat16,
-    device_map="cpu",            # catalog/features can stay on CPU
-)
-model.eval()
-```
-
-Notes:
-
-- Prefer **CPU** (or disk offload) for cataloging large models — you are not training.
-- Keep `torch_dtype=bfloat16` (or float16) so you are inspecting the true full-precision weights.
-- Do **not** load 4-bit / 8-bit bitsandbytes weights here.
-
----
-
-## Example
+### A) Ollama GGUF (current default)
 
 ```text
-MODEL_PATH = ~/.cache/odg/models/gemma-3-270m/
-
-Loaded:
-  GemmaForCausalLM
-  layers: 18
-  hidden_size: 640
-  vocab_size: 262144
+local_path = ~/.ollama/models/blobs/sha256-…
+     │
+     ▼
+Parse GGUF header
+     │
+     ▼
+Tensor index (name, shape, dtype, offset)
 ```
 
-For very large models:
+Does **not** expand Q8 weights into BF16 RAM.
 
-```python
-# Option A: safetensors only (no full module) — still enough for weight stats
-from safetensors import safe_open
-with safe_open("model.safetensors", framework="pt") as f:
-    for key in f.keys():
-        t = f.get_tensor(key)
-        ...
+### B) HF safetensors (with `--prefer-hf`)
 
-# Option B: device_map="auto" / low_cpu_mem_usage=True when needed
+```text
+local_path = HF snapshot dir
+     │
+     ▼
+safetensors mmap index + config.json
 ```
+
+---
+
+## Command
+
+```bash
+odg load --model functiongemma:latest
+odg status --model functiongemma:latest
+```
+
+Requires Step 01 done for that run.
 
 ---
 
 ## Done when
 
-- [ ] Model (or safetensors handle) opens without loading a quantized format
-- [ ] `config.json` readable (layer count, architectures)
+- [x] Source file/dir opens
+- [x] `n_tensors` known
+- [x] Checkpoint written under `steps/02_load/`
+
+## Implementation
+
+[02-load-model-impl.md](./02-load-model-impl.md)
 
 ## Next
 

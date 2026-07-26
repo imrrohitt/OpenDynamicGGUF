@@ -44,8 +44,8 @@ Each step file answers the same questions:
 |---|---|---|---|
 | 00 | Checkpoint store | [00-checkpoint-store.md](./00-checkpoint-store.md) | Filesystem run store so no step is lost |
 | 01 | Resolve model | [01-resolve-model.md](./01-resolve-model.md) · [impl](./01-resolve-model-impl.md) | Any user ref → original BF16 HF |
-| 02 | Load model | [02-load-model.md](./02-load-model.md) | Load BF16 into memory with Transformers |
-| 03 | Enumerate tensors | [03-enumerate-tensors.md](./03-enumerate-tensors.md) | List every parameter via `state_dict()` |
+| 02 | Load model | [02-load-model.md](./02-load-model.md) · [impl](./02-load-model-impl.md) | Open GGUF/HF and build tensor index |
+| 03 | Enumerate tensors | [03-enumerate-tensors.md](./03-enumerate-tensors.md) | Flat inventory: name / shape / dtype / nbytes |
 | 04 | Classify tensors | [04-classify-tensors.md](./04-classify-tensors.md) | Map each name → role (attn_q, ffn_up, …) |
 | 05 | Build catalog | [05-build-tensor-catalog.md](./05-build-tensor-catalog.md) | Structured inventory of all tensors |
 | 06 | Weight features | [06-compute-weight-features.md](./06-compute-weight-features.md) | Mean/var/norms from weights alone |

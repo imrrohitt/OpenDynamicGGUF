@@ -57,6 +57,26 @@ def main(argv: list[str] | None = None) -> int:
     p_resolve.add_argument("--cache-dir", type=Path, default=None)
     p_resolve.add_argument("--no-explain", action="store_true")
 
+    # --- load (step 02) ---
+    p_load = sub.add_parser(
+        "load",
+        help="Step 02: open resolved model (GGUF/HF) and checkpoint tensor index",
+    )
+    p_load.add_argument("--model", "-m", default=None, help="Model ref (uses CURRENT run)")
+    p_load.add_argument("--run", default=None, help="run_id (default: CURRENT for --model)")
+    p_load.add_argument("--force", action="store_true", help="Re-run even if done")
+    p_load.add_argument("--no-explain", action="store_true")
+
+    # --- enumerate (step 03) ---
+    p_enum = sub.add_parser(
+        "enumerate",
+        help="Step 03: list every tensor (name/shape/dtype/nbytes) from Step 02 index",
+    )
+    p_enum.add_argument("--model", "-m", default=None)
+    p_enum.add_argument("--run", default=None)
+    p_enum.add_argument("--force", action="store_true")
+    p_enum.add_argument("--no-explain", action="store_true")
+
     # --- status / runs ---
     p_status = sub.add_parser("status", help="Show checkpoint status for a run")
     p_status.add_argument("--run", default=None, help="run_id (default: latest for --model)")
@@ -68,6 +88,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "resolve":
         return cmd_resolve(args)
+    if args.command == "load":
+        return cmd_load(args)
+    if args.command == "enumerate":
+        return cmd_enumerate(args)
     if args.command == "status":
         return cmd_status(args)
     if args.command == "runs":
@@ -176,6 +200,190 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_load(args: argparse.Namespace) -> int:
+    from odg.load import load_model
+    from odg.load.load import tensor_index_from_resolve
+    from odg.store import StepAlreadyDone
+
+    print_explain = not args.no_explain
+    store = _store(args)
+
+    try:
+        meta = _require_run(store, model=args.model, run_id=args.run)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if not store.is_step_done(meta.run_id, "resolve"):
+        print(
+            "ERROR: Step 01 (resolve) is not done for this run.\n"
+            f"  Run: odg resolve --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+
+    resolve_out = store.read_step_output(meta.run_id, "resolve")
+    if not resolve_out:
+        print("ERROR: missing resolve output.json", file=sys.stderr)
+        return 1
+
+    if print_explain:
+        _banner_load(meta.model_ref, meta.run_id, meta.root)
+
+    if store.is_step_done(meta.run_id, "load") and not args.force:
+        out = store.read_step_output(meta.run_id, "load")
+        if print_explain:
+            print("Step 02 already checkpointed as done — loading from store.")
+            print(f"  path: {store.step_path(meta.run_id, 'load')}")
+            print("  (pass --force to re-run)\n")
+            print(json.dumps(out, indent=2))
+            print("\n" + store.summary(meta.run_id))
+        elif out:
+            print(json.dumps(out, indent=2))
+        return 0
+
+    input_data = {
+        "from_step": "resolve",
+        "local_path": resolve_out.get("local_path"),
+        "source_is_quantized": resolve_out.get("source_is_quantized"),
+    }
+
+    try:
+        step_dir = store.begin_step(meta.run_id, "load", input_data, force=args.force)
+    except StepAlreadyDone:
+        return cmd_load(args)
+
+    try:
+        loaded = load_model(resolve_out)
+        # Full tensor index for Step 03 (separate artifact — can be large)
+        tensors = tensor_index_from_resolve(resolve_out)
+    except Exception as exc:  # noqa: BLE001
+        store.fail_step(meta.run_id, "load", str(exc))
+        print(f"\nERROR in Step 02 load: {exc}", file=sys.stderr)
+        print(f"Checkpointed failure → {store.step_path(meta.run_id, 'load')}")
+        return 1
+
+    payload = loaded.to_dict()
+    log_text = "\n".join(loaded.steps_log) + "\n"
+    store.complete_step(
+        meta.run_id,
+        "load",
+        payload,
+        log_text=log_text,
+        extra_artifacts={
+            "tensor_index.json": json.dumps(tensors, indent=2).encode("utf-8") + b"\n",
+        },
+    )
+
+    if print_explain:
+        _explain_load(loaded)
+        print("\n=== checkpoint saved ===")
+        print(f"  run_id   : {meta.run_id}")
+        print(f"  step dir : {step_dir}")
+        print("  files    : input.json, output.json, status.json, log.txt, tensor_index.json")
+        print("\n" + store.summary(meta.run_id))
+        print("\n=== load result (JSON) ===")
+        print(json.dumps(payload, indent=2))
+    else:
+        print(json.dumps(payload, indent=2))
+
+    return 0
+
+
+def cmd_enumerate(args: argparse.Namespace) -> int:
+    from odg.enumerate import enumerate_tensors
+    from odg.enumerate.enumerate import to_tsv
+    from odg.store import StepAlreadyDone
+
+    print_explain = not args.no_explain
+    store = _store(args)
+
+    try:
+        meta = _require_run(store, model=args.model, run_id=args.run)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if not store.is_step_done(meta.run_id, "load"):
+        print(
+            "ERROR: Step 02 (load) is not done.\n"
+            f"  Run: odg load --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if print_explain:
+        _banner_enumerate(meta.model_ref, meta.run_id, meta.root)
+
+    if store.is_step_done(meta.run_id, "enumerate") and not args.force:
+        out = store.read_step_output(meta.run_id, "enumerate")
+        if print_explain:
+            print("Step 03 already checkpointed as done — loading from store.")
+            print(f"  path: {store.step_path(meta.run_id, 'enumerate')}")
+            print("  (pass --force to re-run)\n")
+            print(json.dumps(out, indent=2))
+            print("\n" + store.summary(meta.run_id))
+        elif out:
+            print(json.dumps(out, indent=2))
+        return 0
+
+    index_path = store.step_path(meta.run_id, "load") / "tensor_index.json"
+    if not index_path.is_file():
+        print(f"ERROR: missing {index_path}", file=sys.stderr)
+        return 1
+    tensor_index = json.loads(index_path.read_text())
+
+    input_data = {
+        "from_step": "load",
+        "tensor_index_path": str(index_path),
+        "n_tensors_in": len(tensor_index),
+    }
+
+    try:
+        step_dir = store.begin_step(
+            meta.run_id, "enumerate", input_data, force=args.force
+        )
+    except StepAlreadyDone:
+        return cmd_enumerate(args)
+
+    try:
+        result = enumerate_tensors(tensor_index)
+    except Exception as exc:  # noqa: BLE001
+        store.fail_step(meta.run_id, "enumerate", str(exc))
+        print(f"\nERROR in Step 03 enumerate: {exc}", file=sys.stderr)
+        return 1
+
+    payload = result.summary_dict()
+    full = result.to_dict()
+    tsv = to_tsv(result.tensors)
+    log_text = "\n".join(result.steps_log) + "\n"
+
+    store.complete_step(
+        meta.run_id,
+        "enumerate",
+        payload,
+        log_text=log_text,
+        extra_artifacts={
+            "tensors.json": json.dumps(full, indent=2).encode("utf-8") + b"\n",
+            "tensors.tsv": tsv.encode("utf-8"),
+        },
+    )
+
+    if print_explain:
+        _explain_enumerate(result)
+        print("\n=== checkpoint saved ===")
+        print(f"  run_id   : {meta.run_id}")
+        print(f"  step dir : {step_dir}")
+        print("  files    : output.json, tensors.json, tensors.tsv, status.json, log.txt")
+        print("\n" + store.summary(meta.run_id))
+        print("\n=== enumerate summary (JSON) ===")
+        print(json.dumps(payload, indent=2))
+    else:
+        print(json.dumps(payload, indent=2))
+
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     store = _store(args)
     if args.run:
@@ -208,6 +416,22 @@ def cmd_runs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _require_run(store, *, model: str | None, run_id: str | None):
+    if run_id:
+        return store.load_run(run_id)
+    if model:
+        meta = store.latest_run_for_model(model)
+        if meta is None:
+            raise ValueError(
+                f"No run for model {model!r}. First run: odg resolve --model {model}"
+            )
+        return meta
+    runs = store.list_runs()
+    if not runs:
+        raise ValueError("No runs yet. First run: odg resolve --model …")
+    return runs[0]
+
+
 def _banner(model: str, run_id: str, root: str) -> None:
     print(
         """
@@ -233,6 +457,114 @@ What this step does
   This step does NOT load the neural net and does NOT quantize.
 """.rstrip()
     )
+
+
+def _banner_load(model: str, run_id: str, root: str) -> None:
+    print(
+        """
+╔══════════════════════════════════════════════════════════════╗
+║  OpenDynamicGGUF — Step 02: Load model                      ║
+╚══════════════════════════════════════════════════════════════╝
+""".rstrip()
+    )
+    print(
+        f"""
+What this step does
+-------------------
+  Input : Step 01 resolve output (local_path)
+  Model : {model}
+
+  For Ollama GGUF: open the file, parse header + tensor index
+  (does NOT dequantize all weights into BF16 RAM).
+
+  Checkpoint
+  ----------
+  run_id : {run_id}
+  root   : {root}
+""".rstrip()
+    )
+
+
+def _banner_enumerate(model: str, run_id: str, root: str) -> None:
+    print(
+        """
+╔══════════════════════════════════════════════════════════════╗
+║  OpenDynamicGGUF — Step 03: Enumerate tensors               ║
+╚══════════════════════════════════════════════════════════════╝
+""".rstrip()
+    )
+    print(
+        f"""
+What this step does
+-------------------
+  Input : Step 02 tensor_index.json
+  Model : {model}
+  Goal  : Flat inventory of EVERY tensor (name, shape, dtype, nbytes).
+          No roles yet — that is Step 04.
+
+  Checkpoint
+  ----------
+  run_id : {run_id}
+  root   : {root}
+""".rstrip()
+    )
+
+
+def _explain_enumerate(result) -> None:
+    print("\n=== what happened ===")
+    for line in result.steps_log:
+        print(f"  • {line}")
+
+    print("\n=== verdict ===")
+    print(f"  ✓ Tensors            : {result.n_tensors}")
+    print(f"  ✓ Total elements     : {result.total_elements:,}")
+    print(f"  ✓ Approx nbytes      : {result.total_nbytes:,}")
+    print(f"  ✓ Dtype summary      : {result.dtype_summary}")
+
+    print("\n=== by layer (tensor counts) ===")
+    # show compact: global + first/last few layers
+    items = list(result.layer_summary.items())
+    for k, v in items[:6]:
+        print(f"  layer {k:>6}: {v} tensors")
+    if len(items) > 8:
+        print("  …")
+        for k, v in items[-2:]:
+            print(f"  layer {k:>6}: {v} tensors")
+
+    print("\n=== sample (sorted by name) ===")
+    for t in result.tensors[:10]:
+        shape = "×".join(str(d) for d in t.shape)
+        print(f"  {t.name:42} {shape:16} {t.dtype:6}  {t.nbytes:>10,} B")
+
+    print("\n=== next ===")
+    print("  Step 04 — classify each tensor into a role (attn_q, ffn_up, norm, …).")
+
+
+def _explain_load(loaded) -> None:
+    print("\n=== what happened ===")
+    for line in loaded.steps_log:
+        print(f"  • {line}")
+
+    print("\n=== verdict ===")
+    print(f"  ✓ Backend            : {loaded.backend}")
+    print(f"  ✓ Source path        : {loaded.source_path}")
+    print(f"  ✓ Tensors indexed    : {loaded.n_tensors}")
+    print(f"  ✓ File size          : {loaded.file_size_bytes:,} bytes")
+    print(f"  ✓ Architecture       : {loaded.architecture}")
+    print(f"  ✓ Layers / embed     : {loaded.layer_count} / {loaded.embedding_length}")
+    print(f"  ✓ Vocab size         : {loaded.vocab_size}")
+    print(f"  ✓ Quantized source?  : {loaded.source_is_quantized}")
+    print(f"  ✓ Dtype summary      : {loaded.dtype_summary}")
+    if loaded.sample_tensors:
+        print("\n=== sample tensors ===")
+        for t in loaded.sample_tensors[:8]:
+            print(f"  {t.name:40} shape={t.shape}  dtype={t.dtype}")
+    if loaded.notes:
+        print("\n  notes:")
+        for n in loaded.notes:
+            print(f"    - {n}")
+    print("\n=== next ===")
+    print("  Step 03 — enumerate/classify every tensor into the catalog.")
 
 
 def _explain(result) -> None:
