@@ -56,4 +56,5 @@ py-modules = [
   "optimizer",
   "export",
   "validate",
+  "quant_formats",
 ]

@@ -51,6 +51,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Re-run resolve even if already checkpointed as done",
     )
     p_resolve.add_argument(
+        "--quant",
+        "-q",
+        default=None,
+        metavar="FORMAT",
+        help=(
+            "Target framework (dynamic mix under the hood): "
+            "q4_k_m, q5_k_m, q3_k_m, q4_k_s, q5_k_s, q6_k, q8_0, q2_k, "
+            "iq4_xs, iq4_nl, iq3_m, iq2_xxs, q4_0. "
+            "If omitted in a TTY, you will be asked interactively."
+        ),
+    )
+    p_resolve.add_argument(
+        "--no-ask",
+        action="store_true",
+        help="Do not prompt for quant format; use --quant or default q4_k_m",
+    )
+    p_resolve.add_argument(
         "--out",
         type=Path,
         default=None,
@@ -246,8 +263,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_sens.add_argument(
         "--baseline",
-        default="Q6_K",
-        help="Baseline type for Δbytes (default Q6_K)",
+        default=None,
+        help="Baseline type for Δbytes (default: from run --quant profile)",
+    )
+    p_sens.add_argument(
+        "--quant",
+        "-q",
+        default=None,
+        metavar="FORMAT",
+        help="Override run quant target for this step",
     )
     p_sens.add_argument("--no-explain", action="store_true")
 
@@ -263,13 +287,20 @@ def main(argv: list[str] | None = None) -> int:
         "--budget-mb",
         type=float,
         default=None,
-        help="Target size in MiB (default: ~72%% of all-Q6_K estimate)",
+        help="Target size in MiB (default: from run quant profile ratio)",
     )
     p_opt.add_argument(
         "--budget-ratio",
         type=float,
-        default=0.72,
-        help="If --budget-mb omitted, fraction of Q6_K baseline size (default 0.72)",
+        default=None,
+        help="If --budget-mb omitted, fraction of Q6_K baseline (default: from --quant)",
+    )
+    p_opt.add_argument(
+        "--quant",
+        "-q",
+        default=None,
+        metavar="FORMAT",
+        help="Override run quant target for this step",
     )
     p_opt.add_argument(
         "--no-pins",
@@ -299,8 +330,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_ex.add_argument(
         "--base-type",
-        default="q4_k_m",
-        help="Fallback/base type for llama-quantize (default q4_k_m)",
+        default=None,
+        help="Fallback/base type for llama-quantize (default: from run --quant)",
+    )
+    p_ex.add_argument(
+        "--quant",
+        "-q",
+        default=None,
+        metavar="FORMAT",
+        help="Override run quant target for this step",
     )
     p_ex.add_argument("--no-explain", action="store_true")
 
@@ -324,6 +362,52 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_val.add_argument("--no-explain", action="store_true")
 
+    # --- run (full pipeline in one command) ---
+    p_run = sub.add_parser(
+        "run",
+        help="Run the full pipeline (steps 01–15) in one command",
+    )
+    p_run.add_argument("--model", "-m", required=True, help="Model ref (e.g. functiongemma:latest)")
+    p_run.add_argument(
+        "--quant",
+        "-q",
+        default=None,
+        metavar="FORMAT",
+        help="Target quant framework (omit in a TTY to pick interactively)",
+    )
+    p_run.add_argument(
+        "--no-ask",
+        action="store_true",
+        help="Do not prompt for quant format; use --quant or default q4_k_m",
+    )
+    p_run.add_argument("--new-run", action="store_true", help="Start a fresh run")
+    p_run.add_argument("--run", default=None, help="Resume a specific run_id")
+    p_run.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run every step even if already checkpointed",
+    )
+    p_run.add_argument("--prefer-hf", action="store_true")
+    p_run.add_argument("--download-weights", action="store_true")
+    p_run.add_argument(
+        "--until",
+        default=None,
+        metavar="STEP",
+        help="Stop after this step id (e.g. catalog, optimize, validate)",
+    )
+    p_run.add_argument(
+        "--from-step",
+        default=None,
+        metavar="STEP",
+        help="Start from this step id (skip earlier ones; they must already be done)",
+    )
+    p_run.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Less verbose per-step panels (still shows pipeline progress)",
+    )
+    p_run.add_argument("--no-explain", action="store_true")
+
     # --- status / runs ---
     p_status = sub.add_parser("status", help="Show checkpoint status for a run")
     p_status.add_argument("--run", default=None, help="run_id (default: latest for --model)")
@@ -331,8 +415,16 @@ def main(argv: list[str] | None = None) -> int:
 
     p_runs = sub.add_parser("runs", help="List all checkpointed runs")
 
+    p_formats = sub.add_parser(
+        "formats",
+        help="List supported target quant formats (q4_k_m, q5_k_m, …)",
+    )
+    p_formats.add_argument("--no-explain", action="store_true")
+
     args = parser.parse_args(argv)
 
+    if args.command == "run":
+        return cmd_run(args)
     if args.command == "resolve":
         return cmd_resolve(args)
     if args.command == "load":
@@ -367,6 +459,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_status(args)
     if args.command == "runs":
         return cmd_runs(args)
+    if args.command == "formats":
+        return cmd_formats(args)
 
     parser.error(f"Unknown command {args.command}")
     return 2
@@ -378,7 +472,44 @@ def _store(args: argparse.Namespace):
     return RunStore(args.artifacts)
 
 
+def _apply_quant_format(store, meta, quant: str | None, *, explain: bool = True):
+    """Resolve QuantFormat for a run; optionally override via CLI --quant."""
+    from quant_formats import get_format
+
+    if quant:
+        fmt = get_format(quant)
+        store.set_quant_format(
+            meta.run_id, quant_format=fmt.id, quant_label=fmt.label
+        )
+        meta = store.load_run(meta.run_id)
+    elif meta.quant_format:
+        fmt = get_format(meta.quant_format)
+    else:
+        fmt = get_format(None)
+        store.set_quant_format(
+            meta.run_id, quant_format=fmt.id, quant_label=fmt.label
+        )
+        meta = store.load_run(meta.run_id)
+    if explain:
+        ui.show_quant_choice(fmt, explain=explain)
+    return meta, fmt
+
+
+def cmd_formats(args: argparse.Namespace) -> int:
+    from quant_formats import list_formats_rows
+
+    print_explain = not args.no_explain
+    ui.formats_table(list_formats_rows(), explain=print_explain)
+    if print_explain:
+        ui.info(
+            "Set at start:  odg resolve --model <ref> --quant q5_k_m\n"
+            "Or omit --quant in a terminal to pick interactively."
+        )
+    return 0
+
+
 def cmd_resolve(args: argparse.Namespace) -> int:
+    from quant_formats import get_format
     from resolve import resolve_model
     from store import StepAlreadyDone
 
@@ -391,12 +522,38 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         resume=not args.new_run,
     )
 
+    # --- choose target quant format (initial user decision) ---
+    try:
+        if args.quant:
+            fmt = get_format(args.quant)
+        elif meta.quant_format and not args.new_run:
+            fmt = get_format(meta.quant_format)
+        elif args.no_ask or not sys.stdin.isatty():
+            fmt = get_format(None)
+        else:
+            chosen = ui.prompt_quant_format(
+                default_id="q4_k_m",
+                existing_id=meta.quant_format,
+            )
+            fmt = get_format(chosen)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    store.set_quant_format(
+        meta.run_id, quant_format=fmt.id, quant_label=fmt.label
+    )
+    meta = store.load_run(meta.run_id)
+
     if print_explain:
         _banner(args.model, meta.run_id, meta.root)
+        ui.show_quant_choice(fmt, explain=True)
 
     # Skip if already done
     if store.is_step_done(meta.run_id, "resolve") and not args.force:
         out = store.read_step_output(meta.run_id, "resolve")
+        if out is not None:
+            out = {**out, "quant_format": fmt.id, "quant_label": fmt.label}
         ui.already_done(
             1,
             "resolve",
@@ -412,6 +569,8 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         "model": args.model,
         "prefer_hf": args.prefer_hf,
         "download_weights": args.download_weights,
+        "quant_format": fmt.id,
+        "quant_label": fmt.label,
     }
 
     try:
@@ -436,7 +595,12 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         return 1
 
     payload = result.to_dict()
+    payload["quant_format"] = fmt.id
+    payload["quant_label"] = fmt.label
+    payload["quant_base_type"] = fmt.base_type
+    payload["quant_budget_ratio"] = fmt.budget_ratio
     log_text = "\n".join(result.steps_log) + "\n"
+    log_text += f"quant_format={fmt.id} ({fmt.label})\n"
     store.complete_step(
         meta.run_id,
         "resolve",
@@ -1709,6 +1873,14 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
         )
         return 1
 
+    try:
+        meta, fmt = _apply_quant_format(
+            store, meta, args.quant, explain=print_explain
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
     if print_explain:
         _banner_sensitivity(meta.model_ref, meta.run_id, meta.root)
 
@@ -1744,10 +1916,15 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
     if mode == "auto":
         mode = "proxy"
 
+    baseline = args.baseline or fmt.baseline_type
+    probe_types = list(fmt.probe_types)
+
     input_data = {
         "from_steps": ["reference_logits", "imatrix", "corpus"],
         "mode": mode,
-        "baseline": args.baseline,
+        "baseline": baseline,
+        "probe_types": probe_types,
+        "quant_format": fmt.id,
         "gguf_sha256": freeze_out.get("gguf_sha256"),
         "search_path": str(search_path),
         "n_catalog_groups": len(catalog.get("groups") or {}),
@@ -1770,7 +1947,8 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
                 search_path=search_path if search_path.is_file() else None,
                 imatrix_proxy_path=imatrix_proxy if imatrix_proxy.is_file() else None,
                 mode=mode,
-                baseline_type=args.baseline,
+                probe_types=probe_types,
+                baseline_type=baseline,
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "sensitivity", str(exc))
@@ -1824,6 +2002,14 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         )
         return 1
 
+    try:
+        meta, fmt = _apply_quant_format(
+            store, meta, args.quant, explain=print_explain
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
     if print_explain:
         _banner_optimize(meta.model_ref, meta.run_id, meta.root)
 
@@ -1864,11 +2050,17 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     budget_bytes = None
     if args.budget_mb is not None:
         budget_bytes = int(float(args.budget_mb) * 1024 * 1024)
+    budget_ratio = (
+        float(args.budget_ratio)
+        if args.budget_ratio is not None
+        else float(fmt.budget_ratio)
+    )
 
     input_data = {
         "from_step": "sensitivity",
         "budget_mb": args.budget_mb,
-        "budget_ratio": args.budget_ratio,
+        "budget_ratio": budget_ratio,
+        "quant_format": fmt.id,
         "no_pins": bool(args.no_pins),
         "gguf_sha256": freeze_out.get("gguf_sha256"),
     }
@@ -1888,7 +2080,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
                 catalog=catalog,
                 sensitivity=sensitivity,
                 budget_bytes=budget_bytes,
-                budget_ratio=float(args.budget_ratio),
+                budget_ratio=budget_ratio,
                 hf_repo_id=resolve_out.get("hf_repo_id"),
                 gguf_sha256=freeze_out.get("gguf_sha256"),
                 imatrix_sha256=imatrix_out.get("imatrix_sha256"),
@@ -1962,6 +2154,14 @@ def cmd_export(args: argparse.Namespace) -> int:
         )
         return 1
 
+    try:
+        meta, fmt = _apply_quant_format(
+            store, meta, args.quant, explain=print_explain
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
     if print_explain:
         _banner_export(meta.model_ref, meta.run_id, meta.root)
 
@@ -2006,12 +2206,15 @@ def cmd_export(args: argparse.Namespace) -> int:
     if mode == "auto":
         mode = "dry-run"  # resolved inside export if binary appears
 
+    base_type = args.base_type or fmt.base_type
+
     input_data = {
         "from_step": "optimize",
         "gguf_in": gguf_in,
         "recipe_path": str(recipe_path),
         "mode": args.mode,
-        "base_type": args.base_type,
+        "base_type": base_type,
+        "quant_format": fmt.id,
     }
 
     try:
@@ -2032,7 +2235,7 @@ def cmd_export(args: argparse.Namespace) -> int:
                 imatrix_path=imatrix_path,
                 mode=args.mode,
                 llama_quantize=args.llama_quantize,
-                base_type=args.base_type,
+                base_type=base_type,
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "export", str(exc))
@@ -2249,9 +2452,9 @@ def _banner(model: str, run_id: str, root: str) -> None:
         root=root,
         goal="Turn a model ref into a durable local path + architecture descriptor.",
         bullets=[
+            "Choose target quant format (--quant or interactive picker)",
             "Ollama tags → local GGUF by default (no HF login)",
             "Pass --prefer-hf for original BF16 from Hugging Face",
-            "Does NOT load the neural net and does NOT quantize",
         ],
     )
 

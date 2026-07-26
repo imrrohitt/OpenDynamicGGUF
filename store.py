@@ -47,13 +47,19 @@ class RunMeta:
     current_step: str | None = None
     status: StepStatus = "pending"
     steps: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Target quant profile chosen at run start (see quant_formats.py)
+    quant_format: str | None = None
+    quant_label: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> RunMeta:
-        return cls(**data)
+        from dataclasses import fields as dc_fields
+
+        known = {f.name for f in dc_fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 class RunStore:
@@ -88,7 +94,14 @@ class RunStore:
     # Run lifecycle
     # ------------------------------------------------------------------
 
-    def create_run(self, model_ref: str, run_id: str | None = None) -> RunMeta:
+    def create_run(
+        self,
+        model_ref: str,
+        run_id: str | None = None,
+        *,
+        quant_format: str | None = None,
+        quant_label: str | None = None,
+    ) -> RunMeta:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         rid = run_id or f"{stamp}-{_slug(model_ref)}"
         run_path = self.runs_dir / rid
@@ -107,6 +120,8 @@ class RunStore:
             root=str(run_path),
             status="pending",
             steps=steps_meta,
+            quant_format=quant_format,
+            quant_label=quant_label,
         )
         run_path.mkdir(parents=True)
         (run_path / "steps").mkdir()
@@ -147,6 +162,8 @@ class RunStore:
         *,
         run_id: str | None = None,
         resume: bool = True,
+        quant_format: str | None = None,
+        quant_label: str | None = None,
     ) -> RunMeta:
         """
         Resume the model's CURRENT run if ``resume`` and it exists;
@@ -156,12 +173,35 @@ class RunStore:
             try:
                 return self.load_run(run_id)
             except FileNotFoundError:
-                return self.create_run(model_ref, run_id=run_id)
+                return self.create_run(
+                    model_ref,
+                    run_id=run_id,
+                    quant_format=quant_format,
+                    quant_label=quant_label,
+                )
         if resume:
             existing = self.latest_run_for_model(model_ref)
             if existing is not None:
                 return existing
-        return self.create_run(model_ref)
+        return self.create_run(
+            model_ref,
+            quant_format=quant_format,
+            quant_label=quant_label,
+        )
+
+    def set_quant_format(
+        self,
+        run_id: str,
+        *,
+        quant_format: str,
+        quant_label: str | None = None,
+    ) -> RunMeta:
+        meta = self.load_run(run_id)
+        meta.quant_format = quant_format
+        meta.quant_label = quant_label
+        meta.updated_at = _utc_now()
+        self._write_run_meta(meta)
+        return meta
 
     # ------------------------------------------------------------------
     # Step checkpoints
@@ -311,9 +351,13 @@ class RunStore:
 
     def summary(self, run_id: str) -> str:
         meta = self.load_run(run_id)
+        q = meta.quant_format or "-"
+        if meta.quant_label:
+            q = f"{meta.quant_format} ({meta.quant_label})"
         lines = [
             f"run_id     : {meta.run_id}",
             f"model_ref  : {meta.model_ref}",
+            f"quant      : {q}",
             f"status     : {meta.status}",
             f"current    : {meta.current_step}",
             f"root       : {meta.root}",

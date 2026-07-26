@@ -122,7 +122,14 @@ Every step is checkpointed to a filesystem run store, so you can stop and resume
 
 ```bash
 # 01 · any reference → original full-precision checkpoint + architecture descriptor
+# Interactive: asks which quant format you want (q4_k_m, q5_k_m, …)
 odg resolve --model functiongemma:latest
+
+# Or pass explicitly (no prompt):
+odg resolve --model functiongemma:latest --quant q5_k_m --no-ask
+
+# List formats anytime:
+odg formats
 
 # 02–05 · open the model, inventory tensors, assign roles, build the catalog
 odg load        --model functiongemma:latest
@@ -150,6 +157,8 @@ Useful flags:
 
 | Flag | Effect |
 |---|---|
+| `--quant` / `-q` | Target size/quality framework (`q4_k_m`, `q5_k_m`, `iq4_xs`, …). Dynamic per-tensor mix still runs for better accuracy — set at `resolve` |
+| `--no-ask` | Skip the interactive quant-format picker (use `--quant` or default `q4_k_m`) |
 | `--download-weights` | Fetch the resolved weights instead of only recording the reference |
 | `--prefer-hf` | For Ollama tags, use the upstream Hugging Face BF16 rather than the local GGUF |
 | `--run <id>` / `--new-run` | Resume a specific run, or force a new one |
@@ -837,6 +846,7 @@ Flat modules at the repo root (CLI command is still `odg`):
 OpenDynamicGGUF/
 ├── cli.py                  # odg <command> entry point
 ├── ui.py                   # colorful terminal UI
+├── quant_formats.py        # user-facing quant targets (q4_k_m, q5_k_m, …)
 ├── store.py                # filesystem run store: checkpoints, resume, status
 ├── steps.py                # step registry / ordering
 ├── gguf_tensors.py         # GGUF tensor payload helpers

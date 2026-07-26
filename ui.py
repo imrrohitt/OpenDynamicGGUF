@@ -450,10 +450,11 @@ def run_summary(summary_text: str, *, explain: bool = True) -> None:
 
 def runs_table(runs: Sequence[Any]) -> None:
     if not _HAS_RICH or console is None:
-        print(f"{'RUN_ID':<42} {'STATUS':<10} MODEL")
-        print("-" * 80)
+        print(f"{'RUN_ID':<42} {'STATUS':<10} {'QUANT':<12} MODEL")
+        print("-" * 90)
         for m in runs:
-            print(f"{m.run_id:<42} {m.status:<10} {m.model_ref}")
+            q = getattr(m, "quant_format", None) or "-"
+            print(f"{m.run_id:<42} {m.status:<10} {q:<12} {m.model_ref}")
         return
     table = Table(
         title="OpenDynamicGGUF runs",
@@ -463,6 +464,7 @@ def runs_table(runs: Sequence[Any]) -> None:
     )
     table.add_column("Run ID", style="white")
     table.add_column("Status")
+    table.add_column("Quant", style="odg.key")
     table.add_column("Model", style="odg.val")
     style_map = {
         "done": "odg.done",
@@ -474,7 +476,177 @@ def runs_table(runs: Sequence[Any]) -> None:
         table.add_row(
             m.run_id,
             Text(m.status, style=style_map.get(m.status, "")),
+            getattr(m, "quant_format", None) or "-",
             m.model_ref,
         )
     console.print(table)
+
+
+def formats_table(rows: Sequence[dict[str, str]], *, explain: bool = True) -> None:
+    if not enabled(explain):
+        if explain:
+            print(
+                f"{'#':<3} {'ID':<10} {'SIZE↓ vs BF16':<16} {'bpw':<14} TECHNIQUE"
+            )
+            for i, r in enumerate(rows, 1):
+                print(
+                    f"{i:<3} {r['id']:<10} {r.get('shrink', '-'):<16} "
+                    f"{r['size']:<14} {r.get('technique', '-')}"
+                )
+            print(
+                "\nYou pick a size/quality *target*. OpenDynamicGGUF still applies "
+                "dynamic per-tensor mix so accuracy stays better than flat quant."
+            )
+        return
+    assert console is not None
+    console.print()
+    console.print(
+        Panel(
+            Text.from_markup(
+                "[bold]How to choose[/]\n"
+                "Pick a [odg.key]size / quality target[/] (like Q4_K_M or IQ4_XS).\n"
+                "OpenDynamicGGUF still runs [odg.ok]dynamic per-tensor quantization[/]:\n"
+                "  • hard tensors stay higher precision\n"
+                "  • easy tensors compress more\n"
+                "→ [odg.ok]better accuracy[/] than a flat single-type GGUF at the same size.\n\n"
+                "[odg.muted]Size ↓ is approximate vs BF16/F16 weights (16 bpw).[/]"
+            ),
+            title="[odg.brand]dynamic quantization[/]",
+            border_style="cyan",
+            box=box.ROUNDED,
+        )
+    )
+    table = Table(
+        title="Target frameworks (dynamic mix under the hood)",
+        box=box.ROUNDED,
+        header_style="bold cyan",
+        border_style="cyan",
+        show_lines=False,
+    )
+    table.add_column("#", style="odg.muted", width=3)
+    table.add_column("ID", style="bold white", no_wrap=True)
+    table.add_column("Name", style="odg.key")
+    table.add_column("Size ↓ vs BF16", style="bold green", no_wrap=True)
+    table.add_column("≈ bpw", style="odg.val", no_wrap=True)
+    table.add_column("Technique", style="magenta")
+    table.add_column("Why pick it", style="odg.muted")
+    for i, r in enumerate(rows, 1):
+        table.add_row(
+            str(i),
+            r["id"],
+            r["short"],
+            r.get("shrink", "-"),
+            r["size"],
+            r.get("technique", "-"),
+            r.get("quality") or r.get("description", ""),
+        )
+    console.print(table)
+
+
+def prompt_quant_format(
+    *,
+    default_id: str = "q4_k_m",
+    existing_id: str | None = None,
+) -> str:
+    """
+    Interactive picker. Returns a format id.
+    Falls back to default when stdin is not a TTY.
+    """
+    from quant_formats import (
+        DEFAULT_FORMAT_ID,
+        FORMATS,
+        get_format,
+        list_formats_rows,
+        normalize_format_id,
+    )
+
+    default_id = existing_id or default_id or DEFAULT_FORMAT_ID
+    rows = list_formats_rows()
+
+    if not sys.stdin.isatty():
+        return normalize_format_id(default_id)
+
+    formats_table(rows)
+
+    default_fmt = get_format(default_id)
+    # Find default index
+    default_idx = next(
+        (i for i, f in enumerate(FORMATS, 1) if f.id == default_fmt.id), 1
+    )
+
+    if enabled():
+        assert console is not None
+        console.print()
+        console.print(
+            Panel(
+                Text.from_markup(
+                    "Select the [odg.key]target framework[/] (size class).\n"
+                    "Dynamic quantization still mixes types per tensor for better accuracy.\n\n"
+                    f"Press Enter for default: [odg.ok]{default_idx}[/] "
+                    f"[bold]{default_fmt.label}[/] — {default_fmt.short} "
+                    f"([odg.ok]{default_fmt.shrink_vs_bf16}[/] vs BF16)"
+                ),
+                title="[odg.brand]choose target[/]",
+                border_style="cyan",
+                box=box.ROUNDED,
+            )
+        )
+        prompt = f"Select [1–{len(FORMATS)}] or id (default {default_idx}): "
+        console.print(Text(prompt, style="odg.key"), end="")
+        raw = input().strip()
+    else:
+        print(
+            f"\nChoose target [1–{len(FORMATS)}] or id "
+            f"(default {default_idx} = {default_fmt.id}): ",
+            end="",
+            flush=True,
+        )
+        raw = input().strip()
+
+    if not raw:
+        return default_fmt.id
+    if raw.isdigit():
+        idx = int(raw)
+        if 1 <= idx <= len(FORMATS):
+            return FORMATS[idx - 1].id
+        raise ValueError(f"Choice out of range: {idx}")
+    return normalize_format_id(raw)
+
+
+def show_quant_choice(fmt: Any, *, explain: bool = True) -> None:
+    if not explain:
+        return
+    label = getattr(fmt, "label", str(fmt))
+    short = getattr(fmt, "short", "")
+    base = getattr(fmt, "base_type", "")
+    ratio = getattr(fmt, "budget_ratio", "")
+    desc = getattr(fmt, "description", "")
+    shrink = getattr(fmt, "shrink_vs_bf16", "")
+    tech = getattr(fmt, "technique", "")
+    size = getattr(fmt, "size_hint", "")
+    if not enabled(explain):
+        print(f"\nQuant target: {label} ({short})")
+        print(f"  size ↓ vs BF16: {shrink}  ({size})")
+        print(f"  technique: {tech}")
+        print(f"  base_type={base}  budget_ratio={ratio}")
+        print(f"  {desc}")
+        return
+    assert console is not None
+    console.print()
+    console.print(
+        Panel(
+            Text.from_markup(
+                f"[odg.ok]✓ Target framework[/]  [bold]{label}[/] — {short}\n"
+                f"[odg.key]size ↓ vs BF16[/]  {shrink}  ([odg.muted]{size}[/])\n"
+                f"[odg.key]technique[/]       {tech}\n"
+                f"[odg.key]base_type[/]       {base}\n"
+                f"[odg.key]budget_ratio[/]    {ratio}\n"
+                f"[odg.muted]{desc}[/]\n"
+                f"[odg.ok]Dynamic mix enabled[/] — better accuracy than flat {label}."
+            ),
+            title="[odg.ok]quant target[/]",
+            border_style="green",
+            box=box.ROUNDED,
+        )
+    )
 
