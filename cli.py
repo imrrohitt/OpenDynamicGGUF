@@ -502,8 +502,158 @@ def cmd_formats(args: argparse.Namespace) -> int:
     ui.formats_table(list_formats_rows(), explain=print_explain)
     if print_explain:
         ui.info(
-            "Set at start:  odg resolve --model <ref> --quant q5_k_m\n"
-            "Or omit --quant in a terminal to pick interactively."
+            "One command:     odg run --model <ref> --quant q5_k_m --no-ask\n"
+            "Or step-by-step: odg resolve --model <ref>   (asks for format in a TTY)"
+        )
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Run steps 01–15 in order with one CLI invocation."""
+    from steps import STEPS, STEPS_BY_ID
+
+    print_explain = not args.no_explain and not args.quiet
+    quiet_panels = bool(args.quiet) or bool(args.no_explain)
+
+    pipeline = [
+        ("resolve", cmd_resolve),
+        ("load", cmd_load),
+        ("enumerate", cmd_enumerate),
+        ("classify", cmd_classify),
+        ("catalog", cmd_catalog),
+        ("weight_features", cmd_weight_features),
+        ("corpus", cmd_corpus),
+        ("activation_features", cmd_activation_features),
+        ("freeze_gguf", cmd_freeze_gguf),
+        ("imatrix", cmd_imatrix),
+        ("reference_logits", cmd_reference_logits),
+        ("sensitivity", cmd_sensitivity),
+        ("optimize", cmd_optimize),
+        ("export", cmd_export),
+        ("validate", cmd_validate),
+    ]
+
+    # CLI command names differ slightly from step ids
+    step_cli = {
+        "weight_features": "weight-features",
+        "activation_features": "activation-features",
+        "freeze_gguf": "freeze-gguf",
+        "reference_logits": "reference-logits",
+    }
+
+    start_id = args.from_step.replace("-", "_") if args.from_step else pipeline[0][0]
+    until_id = args.until.replace("-", "_") if args.until else pipeline[-1][0]
+    if start_id not in STEPS_BY_ID:
+        print(f"ERROR: unknown --from-step {args.from_step!r}", file=sys.stderr)
+        return 1
+    if until_id not in STEPS_BY_ID:
+        print(f"ERROR: unknown --until {args.until!r}", file=sys.stderr)
+        return 1
+
+    ids = [s for s, _ in pipeline]
+    try:
+        i0 = ids.index(start_id)
+        i1 = ids.index(until_id)
+    except ValueError:
+        print("ERROR: step not in pipeline", file=sys.stderr)
+        return 1
+    if i0 > i1:
+        print("ERROR: --from-step is after --until", file=sys.stderr)
+        return 1
+    selected = pipeline[i0 : i1 + 1]
+
+    ui.step_banner(
+        0,
+        "Full pipeline",
+        model=args.model,
+        run_id=args.run or "(auto)",
+        root=str(getattr(args, "artifacts", None) or Path.cwd() / "artifacts"),
+        goal="Run selected steps end-to-end (checkpoints resume automatically).",
+        bullets=[
+            f"Steps: {selected[0][0]} → {selected[-1][0]} ({len(selected)} steps)",
+            f"Quant: {args.quant or '(ask / default q4_k_m)'}",
+            "Already-done steps are skipped unless --force",
+        ],
+        explain=not args.no_explain,
+    )
+
+    results: list[tuple[str, str]] = []  # (step_id, status)
+
+    for idx, (step_id, fn) in enumerate(selected, 1):
+        title = STEPS_BY_ID[step_id].title
+        ui.info(
+            f"[{idx}/{len(selected)}] {step_cli.get(step_id, step_id)} — {title}",
+            explain=not args.no_explain,
+        )
+
+        step_args = argparse.Namespace(
+            command=step_cli.get(step_id, step_id.replace("_", "-")),
+            artifacts=args.artifacts,
+            model=args.model,
+            run=args.run,
+            force=bool(args.force),
+            no_explain=quiet_panels,
+            # resolve
+            quant=args.quant,
+            no_ask=bool(args.no_ask),
+            new_run=bool(args.new_run) if step_id == "resolve" else False,
+            prefer_hf=bool(args.prefer_hf),
+            download_weights=bool(args.download_weights),
+            cache_dir=None,
+            out=None,
+            # weight features
+            only_quantizable=True,
+            # corpus
+            target_tokens=50_000,
+            seed=42,
+            # shared mode knobs
+            mode="auto",
+            max_docs=32,
+            convert_script=None,
+            require_bf16=False,
+            llama_imatrix=None,
+            chunks=64,
+            llama_perplexity=None,
+            baseline=None,
+            budget_mb=None,
+            budget_ratio=None,
+            no_pins=False,
+            base_type=None,
+            llama_quantize=None,
+            strict=False,
+        )
+
+        try:
+            code = fn(step_args)
+        except Exception as exc:  # noqa: BLE001
+            ui.error(STEPS_BY_ID[step_id].number, step_id, exc, "(pipeline)")
+            results.append((step_id, "failed"))
+            ui.pipeline_summary(results, explain=not args.no_explain)
+            return 1
+
+        if code != 0:
+            results.append((step_id, "failed"))
+            ui.pipeline_summary(results, explain=not args.no_explain)
+            ui.warn(
+                f"Pipeline stopped at {step_id} (exit {code}). "
+                f"Fix the issue, then: odg run -m {args.model} --from-step {step_id}",
+                explain=not args.no_explain,
+            )
+            return code
+
+        results.append((step_id, "done"))
+        # After resolve, pin run id so later steps hit the same run
+        if step_id == "resolve" and not args.run:
+            store = _store(args)
+            meta = store.latest_run_for_model(args.model)
+            if meta is not None:
+                args.run = meta.run_id
+
+    ui.pipeline_summary(results, explain=not args.no_explain)
+    if not args.no_explain:
+        ui.next_step(
+            f"Pipeline finished. Inspect: odg status --model {args.model}\n"
+            f"Report card lives under steps/15_validate/ when validate ran."
         )
     return 0
 

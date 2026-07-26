@@ -613,6 +613,50 @@ def prompt_quant_format(
     return normalize_format_id(raw)
 
 
+def pipeline_summary(
+    results: Sequence[tuple[str, str]],
+    *,
+    explain: bool = True,
+) -> None:
+    """results: list of (step_id, status) where status is done|failed|skipped."""
+    if not explain:
+        return
+    if not enabled(explain):
+        print("\n=== pipeline ===")
+        for sid, st in results:
+            print(f"  {sid:<24} {st}")
+        return
+    assert console is not None
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold cyan")
+    table.add_column("Step", style="white")
+    table.add_column("Status")
+    style_map = {
+        "done": "odg.done",
+        "failed": "odg.failed",
+        "skipped": "odg.pending",
+        "running": "odg.running",
+    }
+    for sid, st in results:
+        table.add_row(sid, Text(st, style=style_map.get(st, "")))
+    n_ok = sum(1 for _, st in results if st == "done")
+    n_fail = sum(1 for _, st in results if st == "failed")
+    console.print()
+    console.print(
+        Panel(
+            Group(
+                table,
+                Text.from_markup(
+                    f"\n[odg.ok]{n_ok} done[/]  [odg.err]{n_fail} failed[/]  "
+                    f"[odg.muted]{len(results)} total[/]"
+                ),
+            ),
+            title="[odg.brand]pipeline summary[/]",
+            border_style="cyan",
+            box=box.ROUNDED,
+        )
+    )
+
+
 def show_quant_choice(fmt: Any, *, explain: bool = True) -> None:
     if not explain:
         return

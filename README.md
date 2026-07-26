@@ -116,39 +116,39 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
 
-### Run the pipeline that exists today
-
-Every step is checkpointed to a filesystem run store, so you can stop and resume at any point.
+### Run everything in one command
 
 ```bash
-# 01 · any reference → original full-precision checkpoint + architecture descriptor
-# Interactive: asks which quant format you want (q4_k_m, q5_k_m, …)
-odg resolve --model functiongemma:latest
+# Full pipeline (steps 01→15). Asks for quant format in a TTY:
+odg run --model functiongemma:latest
 
-# Or pass explicitly (no prompt):
-odg resolve --model functiongemma:latest --quant q5_k_m --no-ask
+# Non-interactive (scripts / CI):
+odg run --model functiongemma:latest --quant q5_k_m --no-ask
 
-# List formats anytime:
+# Useful variants:
+odg run -m functiongemma:latest -q q4_k_m --no-ask --new-run
+odg run -m functiongemma:latest --until catalog          # stop early
+odg run -m functiongemma:latest --from-step optimize     # resume mid-pipeline
 odg formats
-
-# 02–05 · open the model, inventory tensors, assign roles, build the catalog
-odg load        --model functiongemma:latest
-odg enumerate   --model functiongemma:latest
-odg classify    --model functiongemma:latest
-odg catalog     --model functiongemma:latest
-
-# 06 · weight statistics (no calibration text required)
-odg weight-features --model functiongemma:latest --only-quantizable
-
-# 07 · mixed calibration corpus, split into calib / search / held-out
-odg corpus --model functiongemma:latest --target-tokens 300000
-
-# 08 · activation stats from the calib split (forward hooks if possible, else proxy)
-odg activation-features --model functiongemma:latest
-
-# inspect progress
 odg status --model functiongemma:latest
-odg runs
+```
+
+Already-finished steps are skipped unless you pass `--force`.
+
+### Or run steps one-by-one
+
+Every step is checkpointed, so you can stop and resume at any point.
+
+```bash
+odg resolve --model functiongemma:latest --quant q5_k_m --no-ask
+odg load --model functiongemma:latest
+odg enumerate --model functiongemma:latest
+odg classify --model functiongemma:latest
+odg catalog --model functiongemma:latest
+odg weight-features --model functiongemma:latest --only-quantizable
+odg corpus --model functiongemma:latest --target-tokens 300000
+odg activation-features --model functiongemma:latest
+# … freeze-gguf → imatrix → reference-logits → sensitivity → optimize → export → validate
 ```
 
 Artifacts land under `artifacts/runs/<run-id>/steps/<step>/`, each with its `input.json`, `output.json`, `status.json`, and a log. Re-running a completed step is a no-op unless you pass `--force`; `--new-run` starts a fresh run instead of resuming the current one.
