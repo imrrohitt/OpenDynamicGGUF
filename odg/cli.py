@@ -249,6 +249,33 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_sens.add_argument("--no-explain", action="store_true")
 
+    # --- optimize (step 13) ---
+    p_opt = sub.add_parser(
+        "optimize",
+        help="Step 13: greedy recipe under size budget → recipe.yaml",
+    )
+    p_opt.add_argument("--model", "-m", default=None)
+    p_opt.add_argument("--run", default=None)
+    p_opt.add_argument("--force", action="store_true")
+    p_opt.add_argument(
+        "--budget-mb",
+        type=float,
+        default=None,
+        help="Target size in MiB (default: ~72%% of all-Q6_K estimate)",
+    )
+    p_opt.add_argument(
+        "--budget-ratio",
+        type=float,
+        default=0.72,
+        help="If --budget-mb omitted, fraction of Q6_K baseline size (default 0.72)",
+    )
+    p_opt.add_argument(
+        "--no-pins",
+        action="store_true",
+        help="Disable default role pins (embd/lm_head Q8, attn_v Q5)",
+    )
+    p_opt.add_argument("--no-explain", action="store_true")
+
     # --- status / runs ---
     p_status = sub.add_parser("status", help="Show checkpoint status for a run")
     p_status.add_argument("--run", default=None, help="run_id (default: latest for --model)")
@@ -282,6 +309,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_reference_logits(args)
     if args.command == "sensitivity":
         return cmd_sensitivity(args)
+    if args.command == "optimize":
+        return cmd_optimize(args)
     if args.command == "status":
         return cmd_status(args)
     if args.command == "runs":
@@ -1710,6 +1739,144 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_optimize(args: argparse.Namespace) -> int:
+    from odg.optimizer import optimize_recipes
+    from odg.store import StepAlreadyDone
+
+    print_explain = not args.no_explain
+    store = _store(args)
+
+    try:
+        meta = _require_run(store, model=args.model, run_id=args.run)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if not store.is_step_done(meta.run_id, "sensitivity"):
+        print(
+            "ERROR: Step 12 (sensitivity) is not done.\n"
+            f"  Run: odg sensitivity --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if print_explain:
+        _banner_optimize(meta.model_ref, meta.run_id, meta.root)
+
+    if store.is_step_done(meta.run_id, "optimize") and not args.force:
+        out = store.read_step_output(meta.run_id, "optimize")
+        if print_explain:
+            print("Step 13 already checkpointed as done — loading from store.")
+            print(f"  path: {store.step_path(meta.run_id, 'optimize')}")
+            print("  (pass --force to re-run)\n")
+            print(json.dumps(out, indent=2))
+            print("\n" + store.summary(meta.run_id))
+        elif out:
+            print(json.dumps(out, indent=2))
+        return 0
+
+    sens_path = store.step_path(meta.run_id, "sensitivity") / "sensitivity.json"
+    if not sens_path.is_file():
+        print(f"ERROR: missing {sens_path}", file=sys.stderr)
+        return 1
+    sensitivity = json.loads(sens_path.read_text())
+
+    catalog = None
+    for step_id in ("activation_features", "weight_features", "catalog"):
+        cpath = store.step_path(meta.run_id, step_id) / "tensor_catalog.json"
+        if cpath.is_file():
+            catalog = json.loads(cpath.read_text())
+            break
+    if not catalog:
+        print("ERROR: tensor_catalog.json not found", file=sys.stderr)
+        return 1
+
+    resolve_out = store.read_step_output(meta.run_id, "resolve") or {}
+    freeze_out = store.read_step_output(meta.run_id, "freeze_gguf") or {}
+    imatrix_out = store.read_step_output(meta.run_id, "imatrix") or {}
+    corpus_out = store.read_step_output(meta.run_id, "corpus") or {}
+
+    budget_bytes = None
+    if args.budget_mb is not None:
+        budget_bytes = int(float(args.budget_mb) * 1024 * 1024)
+
+    input_data = {
+        "from_step": "sensitivity",
+        "budget_mb": args.budget_mb,
+        "budget_ratio": args.budget_ratio,
+        "no_pins": bool(args.no_pins),
+        "gguf_sha256": freeze_out.get("gguf_sha256"),
+    }
+
+    try:
+        step_dir = store.begin_step(
+            meta.run_id, "optimize", input_data, force=args.force
+        )
+    except StepAlreadyDone:
+        return cmd_optimize(args)
+
+    try:
+        result = optimize_recipes(
+            model_ref=meta.model_ref,
+            out_dir=step_dir,
+            catalog=catalog,
+            sensitivity=sensitivity,
+            budget_bytes=budget_bytes,
+            budget_ratio=float(args.budget_ratio),
+            hf_repo_id=resolve_out.get("hf_repo_id"),
+            gguf_sha256=freeze_out.get("gguf_sha256"),
+            imatrix_sha256=imatrix_out.get("imatrix_sha256"),
+            corpus_id=corpus_out.get("corpus_id"),
+            use_pins=not args.no_pins,
+        )
+    except Exception as exc:  # noqa: BLE001
+        store.fail_step(meta.run_id, "optimize", str(exc))
+        print(f"\nERROR in Step 13 optimize: {exc}", file=sys.stderr)
+        return 1
+
+    payload = result.summary_dict()
+    # Keep summary smaller
+    payload_out = {
+        "model_ref": result.model_ref,
+        "method": result.method,
+        "budget_bytes": result.budget_bytes,
+        "estimated_bytes": result.estimated_bytes,
+        "predicted_delta_kld": result.predicted_delta_kld,
+        "n_groups": result.n_groups,
+        "recipe_path": result.recipe_path,
+        "tensor_type_file": result.tensor_type_file,
+        "n_pareto": len(result.pareto_paths),
+        "assignments": result.assignments,
+        "steps_log": result.steps_log,
+        "notes": result.notes,
+    }
+    log_text = "\n".join(result.steps_log) + "\n"
+
+    store.complete_step(
+        meta.run_id,
+        "optimize",
+        payload_out,
+        log_text=log_text,
+    )
+
+    if print_explain:
+        _explain_optimize(result)
+        print("\n=== checkpoint saved ===")
+        print(f"  run_id   : {meta.run_id}")
+        print(f"  step dir : {step_dir}")
+        print(
+            "  files    : output.json, recipe.yaml, recipe.tt, "
+            "pareto/, optimize_manifest.json, status.json, log.txt"
+        )
+        print("\n" + store.summary(meta.run_id))
+        print("\n=== optimize summary (JSON) ===")
+        print(json.dumps(payload_out, indent=2))
+    else:
+        print(json.dumps(payload_out, indent=2))
+
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     store = _store(args)
     if args.run:
@@ -2243,6 +2410,65 @@ def _explain_sensitivity(result) -> None:
 
     print("\n=== next ===")
     print("  Step 13 — optimize recipe (maximize bytes saved / ΔKLD under budget).")
+
+
+def _banner_optimize(model: str, run_id: str, root: str) -> None:
+    print(
+        """
+╔══════════════════════════════════════════════════════════════╗
+║  OpenDynamicGGUF — Step 13: Optimize recipe                 ║
+╚══════════════════════════════════════════════════════════════╝
+""".rstrip()
+    )
+    print(
+        f"""
+What this step does
+-------------------
+  Input : sensitivity.json (Step 12)
+  Model : {model}
+  Goal  : Greedy knapsack — assign per-group quant types under a
+          size budget; emit recipe.yaml + recipe.tt + Pareto set.
+
+  Checkpoint
+  ----------
+  run_id : {run_id}
+  root   : {root}
+""".rstrip()
+    )
+
+
+def _explain_optimize(result) -> None:
+    print("\n=== what happened ===")
+    for line in result.steps_log:
+        print(f"  • {line}")
+
+    print("\n=== verdict ===")
+    print(f"  ✓ Method            : {result.method}")
+    print(
+        f"  ✓ Budget / estimate : "
+        f"{result.budget_bytes / (1024**2):.1f} / "
+        f"{result.estimated_bytes / (1024**2):.1f} MiB"
+    )
+    print(f"  ✓ Pred. mean ΔKLD   : {result.predicted_delta_kld:.4f}")
+    print(f"  ✓ Groups assigned   : {result.n_groups}")
+    print(f"  ✓ recipe.yaml       : {result.recipe_path}")
+    print(f"  ✓ recipe.tt         : {result.tensor_type_file}")
+    print(f"  ✓ Pareto recipes    : {len(result.pareto_paths)}")
+
+    print("\n=== sample assignments ===")
+    for i, (gid, q) in enumerate(sorted(result.assignments.items())):
+        if i >= 12:
+            print(f"  … ({len(result.assignments) - 12} more)")
+            break
+        print(f"  {gid:<22} → {q}")
+
+    if result.notes:
+        print("\n=== notes ===")
+        for n in result.notes:
+            print(f"  • {n}")
+
+    print("\n=== next ===")
+    print("  Step 14 — export GGUF from recipe (llama-quantize + imatrix).")
 
 
 def _banner_classify(model: str, run_id: str, root: str) -> None:

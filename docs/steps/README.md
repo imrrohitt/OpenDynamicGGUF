@@ -55,7 +55,7 @@ Each step file answers the same questions:
 | 10 | Build imatrix | [10-build-imatrix.md](./10-build-imatrix.md) | `odg imatrix` — llama-imatrix or proxy |
 | 11 | Reference logits | [11-cache-reference-logits.md](./11-cache-reference-logits.md) | `odg reference-logits` — KL base caches |
 | 12 | Sensitivity probe | [12-sensitivity-probe.md](./12-sensitivity-probe.md) | `odg sensitivity` — Δbytes/ΔKLD table |
-| 13 | Optimize recipe | [13-optimize-recipe.md](./13-optimize-recipe.md) | Maximize bytes saved / ΔKLD |
+| 13 | Optimize recipe | [13-optimize-recipe.md](./13-optimize-recipe.md) | `odg optimize` — greedy knapsack → recipe.yaml |
 | 14 | Export GGUF | [14-export-gguf.md](./14-export-gguf.md) | Recipe → final quantized GGUF |
 | 15 | Validate & release | [15-validate-and-release.md](./15-validate-and-release.md) | Tiered gates; ship or feedback |
 

@@ -6,82 +6,57 @@
 
 ## Goal
 
-Using the sensitivity table, assign a quantization type to every group so that **quality is maximized under a size/VRAM budget** (equivalently: maximize bytes saved per unit ΔKLD).
+Using the sensitivity table, assign a quantization type to every group so size stays under budget while maximizing bytes saved per unit ΔKLD.
 
-Emit a **Pareto set** of recipes, not a single opaque config.
-
----
-
-## Why it exists
-
-Hand-picking `Q4_K_M` everywhere wastes bits on easy tensors and starves sensitive ones. The optimizer turns measurements into an assignable recipe.
+Emit `recipe.yaml`, `recipe.tt`, and a **Pareto set** of alternatives.
 
 ---
 
-## Inputs / Outputs
+## Command
 
-| | |
+```bash
+odg optimize --model functiongemma:latest
+odg optimize --model functiongemma:latest --budget-mb 180 --force
+```
+
+Requires Step 12.
+
+| Flag | Meaning |
 |---|---|
-| **Input** | Sensitivity table + target size (e.g. 3.2 GB) |
-| **Output** | `recipe.yaml` candidates (Pareto frontier) |
+| `--budget-mb` | Absolute target size (MiB) |
+| `--budget-ratio` | Default `0.72` of all-Q6_K estimate when mb omitted |
+| `--no-pins` | Disable embd/lm_head→Q8 and attn_v→Q5 floors |
 
 ---
 
-## How it works
+## Algorithm (v1)
 
-### Objective
-
-```text
-maximize   Σ bytes_saved(group, quant)
-subject to Σ size(group, quant) ≤ budget
-           (proxy: maximize bytes_saved / ΔKLD greedily)
-```
-
-### Algorithm (v1)
-
-1. **Start** all groups at a safe high type (e.g. Q6_K / Q8 for embd & lm_head).  
-2. **Greedy:** repeatedly apply the downgrade with best `Δbytes / ΔKLD` until budget met.  
-3. **Refine:** try ±1 level swaps with *joint* re-measure (full candidate KLD on search).  
-4. **Emit** top frontier points (smaller/faster vs higher fidelity).
-
-Skip Bayesian / evolutionary search in v1 — each eval is expensive; greedy + local search is enough.
-
-### Pins (defaults, still overridable by probes)
-
-```text
-embedding, lm_head     → Q8_0
-attn_v (often)         → ≥ Q5_K / Q6_K
-norm                   → skip (F16)
-router (MoE)           → pin high
-```
+1. Start all quantizable groups at Q6_K (respecting role pins).  
+2. Greedily apply the downgrade with best `Δbytes / ΔKLD` until size ≤ budget.  
+3. Emit Pareto recipes at several budget ratios.
 
 ---
 
-## Example
-
-Budget: **3.2 GB**
+## Outputs
 
 ```text
-After greedy:
-  embedding, output     Q8_0
-  attn_v @ all          Q6_K
-  attn_q/k early        Q5_K
-  attn_q/k mid/late     Q4_K
-  ffn_gate/up mid       Q3_K
-  ffn_down              Q4_K
-  estimated size        3.18 GB
-  predicted mean ΔKLD   0.008
+steps/13_optimize/
+  recipe.yaml              # primary odg/recipe/v1
+  recipe.tt                # llama-quantize --tensor-type-file
+  pareto/*.yaml            # frontier alternatives
+  optimize_manifest.json
+  output.json
+  status.json
+  log.txt
 ```
-
-Write `recipe.yaml` (see main README recipe section for full schema).
 
 ---
 
 ## Done when
 
-- [ ] ≥1 recipe meets budget
-- [ ] Assignments traceable to sensitivity rows
-- [ ] Pareto alternatives saved for the user
+- [x] ≥1 recipe written with per-group assignments
+- [x] Traceable to sensitivity rows
+- [x] Pareto alternatives saved
 
 ## Next
 
