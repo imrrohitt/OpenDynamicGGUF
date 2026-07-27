@@ -65,6 +65,7 @@ Each step file answers the same questions:
 
 - How to use (install, dry-run, real export): [`../USAGE.md`](../USAGE.md)
 - High-level overview: [`../../README.md`](../../README.md)
+- Platform expansion (hardware-aware `odg fit`, benchmarks, marketplace, leaderboard, …): [`../../ARCHITECTURE.md`](../../ARCHITECTURE.md) · [`../platform/README.md`](../platform/README.md)
 - Interactive canvas (if present): architecture canvas in Cursor project `canvases/`
 
 **Rule to remember for every step:** statistics and features *prioritize*; measured ΔKLD *decides*; held-out validation *ships*.

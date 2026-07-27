@@ -902,6 +902,13 @@ Three shippable milestones — each independently useful before the next exists:
 
 Later experiments (explicitly *not* v1): smarter search (Bayesian / evolutionary), per-expert bit allocation from usage counts, KV-cache quantization sensitivity, attention-head and neuron-level importance, LLM-in-the-loop failure analysis suggesting recipe changes.
 
+### Beyond M3 — the platform
+
+After M3, the project grows from a quantization tool into an **open optimization platform**: hardware-aware optimization (`odg fit --gpu 24GB`), a benchmark runner, HTML reports, a community recipe marketplace, a public leaderboard, one-command Hugging Face publishing, and more.
+
+- Target architecture: [`ARCHITECTURE.md`](ARCHITECTURE.md)
+- Per-feature breakdowns (15 features, each split into small shippable steps): [`docs/platform/README.md`](docs/platform/README.md)
+
 ---
 
 ## Cost & hardware expectations
