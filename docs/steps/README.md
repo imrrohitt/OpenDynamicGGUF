@@ -63,6 +63,7 @@ Each step file answers the same questions:
 
 ## Related
 
+- How to use (install, dry-run, real export): [`../USAGE.md`](../USAGE.md)
 - High-level overview: [`../../README.md`](../../README.md)
 - Interactive canvas (if present): architecture canvas in Cursor project `canvases/`
 

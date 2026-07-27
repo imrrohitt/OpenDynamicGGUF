@@ -18,6 +18,7 @@
 
 <p>
   <a href="#quick-start">Quick start</a> ·
+  <a href="docs/USAGE.md">Usage guide</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#project-status">Status</a> ·
   <a href="docs/steps/README.md">Step-by-step docs</a> ·
@@ -55,7 +56,7 @@ output                -> Q8_0     (pinned)
 ```
 
 > [!IMPORTANT]
-> This project is in **alpha**. Steps **00–08** are implemented and usable today (resolve → load → enumerate → classify → catalog → weight features → calibration corpus → activation features). `odg quantize` is the target end-to-end command and lands with milestone M3. See [Project status](#project-status).
+> This project is in **alpha**. The full CLI pipeline (`odg run`, steps 01–15) is available. Without a local [llama.cpp](https://github.com/ggml-org/llama.cpp) build, export stays in **`dry_run`** (recipe + size estimate only — **no `.gguf` written**). See the **[Usage guide](docs/USAGE.md)** for install, dry-run vs real export, and how to produce a real file.
 
 ### What makes it different
 
@@ -73,6 +74,7 @@ output                -> Q8_0     (pinned)
 
 - [Overview](#overview)
 - [Quick start](#quick-start)
+- [Usage guide](docs/USAGE.md)
 - [Project status](#project-status)
 - [How it works](#how-it-works)
 - [Why this project exists](#why-this-project-exists)
@@ -99,6 +101,8 @@ output                -> Q8_0     (pinned)
 ---
 
 ## Quick start
+
+> Full walkthrough (llama.cpp setup, dry-run vs real GGUF, size estimates, troubleshooting): **[`docs/USAGE.md`](docs/USAGE.md)**.
 
 ### Requirements
 
@@ -134,6 +138,14 @@ odg status --model functiongemma:latest
 ```
 
 Already-finished steps are skipped unless you pass `--force`.
+
+> [!TIP]
+> If export finished as **`dry_run`** (`gguf_out: null`), no GGUF was written. Install llama.cpp, then:
+> ```bash
+> export LLAMA_CPP_DIR=~/llama.cpp
+> odg export --model functiongemma:latest --mode llama --force
+> ```
+> Details: [Usage guide → Write the real quantized GGUF](docs/USAGE.md#6-write-the-real-quantized-gguf).
 
 ### Or run steps one-by-one
 
