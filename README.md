@@ -906,6 +906,14 @@ Later experiments (explicitly *not* v1): smarter search (Bayesian / evolutionary
 
 After M3, the project grows from a quantization tool into an **open optimization platform**: hardware-aware optimization (`odg fit --gpu 24GB`), a benchmark runner, HTML reports, a community recipe marketplace, a public leaderboard, one-command Hugging Face publishing, and more.
 
+**Phase 1 is implemented:**
+
+```bash
+odg fit --model functiongemma:latest --gpu 12GB    # hardware in, budget out (odg devices lists profiles)
+odg benchmark model-UD.gguf --suite smoke          # → benchresult.json (paired deltas vs BF16)
+odg report --model functiongemma:latest            # → self-contained report.html
+```
+
 - Target architecture: [`ARCHITECTURE.md`](ARCHITECTURE.md)
 - Per-feature breakdowns (15 features, each split into small shippable steps): [`docs/platform/README.md`](docs/platform/README.md)
 

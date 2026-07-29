@@ -421,6 +421,128 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_formats.add_argument("--no-explain", action="store_true")
 
+    # --- fit (hardware-aware pipeline: hardware in, budget out) ---
+    p_fit = sub.add_parser(
+        "fit",
+        help="Run the pipeline with a budget derived from your hardware "
+        "(--gpu 12GB / --ram 32GB / --device rtx-3060-12gb)",
+    )
+    p_fit.add_argument("--model", "-m", required=True)
+    p_fit.add_argument("--gpu", default=None, metavar="SIZE", help="VRAM, e.g. 24GB")
+    p_fit.add_argument("--ram", default=None, metavar="SIZE", help="System RAM, e.g. 32GB")
+    p_fit.add_argument(
+        "--device",
+        default=None,
+        metavar="ID",
+        help="Named device profile (see: odg devices)",
+    )
+    p_fit.add_argument(
+        "--cpu-only",
+        action="store_true",
+        help="Treat --ram as a plain CPU pool (no GPU/Metal)",
+    )
+    p_fit.add_argument(
+        "--ctx",
+        type=int,
+        default=None,
+        help="Context length to size the KV cache for (default: min(4096, model ctx))",
+    )
+    p_fit.add_argument(
+        "--kv-dtype",
+        default="f16",
+        choices=("f16", "f32", "q8_0"),
+        help="KV cache dtype for sizing (default f16)",
+    )
+    p_fit.add_argument(
+        "--quant",
+        "-q",
+        default=None,
+        metavar="FORMAT",
+        help="Quant family for probe types / base type (default q4_k_m); "
+        "the size budget itself comes from your hardware",
+    )
+    p_fit.add_argument("--new-run", action="store_true")
+    p_fit.add_argument("--run", default=None)
+    p_fit.add_argument("--force", action="store_true")
+    p_fit.add_argument("--prefer-hf", action="store_true")
+    p_fit.add_argument("--download-weights", action="store_true")
+    p_fit.add_argument(
+        "--until",
+        default=None,
+        metavar="STEP",
+        help="Stop after this step id (default: run through validate)",
+    )
+    p_fit.add_argument("--quiet", action="store_true")
+    p_fit.add_argument("--no-explain", action="store_true")
+
+    # --- devices (named hardware profiles for odg fit) ---
+    p_dev = sub.add_parser(
+        "devices",
+        help="List named hardware profiles usable with odg fit --device",
+    )
+    p_dev.add_argument("--no-explain", action="store_true")
+
+    # --- benchmark (suite runner → benchresult.json) ---
+    p_bench = sub.add_parser(
+        "benchmark",
+        help="Benchmark a GGUF (throughput via llama-bench; quality via lm-eval "
+        "when installed) → benchresult.json",
+    )
+    p_bench.add_argument(
+        "gguf",
+        nargs="?",
+        default=None,
+        help="Path to a .gguf (default: the run's exported GGUF)",
+    )
+    p_bench.add_argument("--model", "-m", default=None)
+    p_bench.add_argument("--run", default=None)
+    p_bench.add_argument(
+        "--suite",
+        default="smoke",
+        help="Suite id: smoke (default), standard, coding",
+    )
+    p_bench.add_argument(
+        "--device",
+        default=None,
+        metavar="ID",
+        help="Tag throughput with a named hardware profile",
+    )
+    p_bench.add_argument(
+        "--llama-bench",
+        type=Path,
+        default=None,
+        help="Path to llama-bench binary (or set LLAMA_CPP_DIR)",
+    )
+    p_bench.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Output dir for benchresult.json (default: <run>/benchmarks/…)",
+    )
+    p_bench.add_argument("--no-explain", action="store_true")
+
+    # --- report (self-contained report.html from run artifacts) ---
+    p_report = sub.add_parser(
+        "report",
+        help="Render report.html (allocations, sensitivity heatmap, Pareto, "
+        "gates, benchmarks) from run artifacts",
+    )
+    p_report.add_argument("--model", "-m", default=None)
+    p_report.add_argument("--run", default=None)
+    p_report.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Output path (default: <run>/report.html)",
+    )
+    p_report.add_argument(
+        "--open",
+        action="store_true",
+        dest="open_browser",
+        help="Open the report in a browser after writing it",
+    )
+    p_report.add_argument("--no-explain", action="store_true")
+
     args = parser.parse_args(argv)
 
     if args.command == "run":
@@ -461,6 +583,14 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_runs(args)
     if args.command == "formats":
         return cmd_formats(args)
+    if args.command == "fit":
+        return cmd_fit(args)
+    if args.command == "devices":
+        return cmd_devices(args)
+    if args.command == "benchmark":
+        return cmd_benchmark(args)
+    if args.command == "report":
+        return cmd_report(args)
 
     parser.error(f"Unknown command {args.command}")
     return 2
@@ -615,7 +745,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             chunks=64,
             llama_perplexity=None,
             baseline=None,
-            budget_mb=None,
+            # threaded through by odg fit (hardware-derived budget)
+            budget_mb=getattr(args, "budget_mb", None),
             budget_ratio=None,
             no_pins=False,
             base_type=None,
@@ -650,11 +781,27 @@ def cmd_run(args: argparse.Namespace) -> int:
                 args.run = meta.run_id
 
     ui.pipeline_summary(results, explain=not args.no_explain)
+
+    # Auto-render report.html when the pipeline reached validate (best-effort)
+    report_path = None
+    if any(sid == "validate" and st == "done" for sid, st in results):
+        try:
+            from report import generate_report
+
+            store = _store(args)
+            meta = _require_run(store, model=args.model, run_id=args.run)
+            report_path = generate_report(Path(meta.root)).report_path
+        except Exception:  # noqa: BLE001 — report must never fail the pipeline
+            report_path = None
+
     if not args.no_explain:
-        ui.next_step(
-            f"Pipeline finished. Inspect: odg status --model {args.model}\n"
-            f"Report card lives under steps/15_validate/ when validate ran."
-        )
+        lines = [
+            f"Pipeline finished. Inspect: odg status --model {args.model}",
+            "Report card lives under steps/15_validate/ when validate ran.",
+        ]
+        if report_path:
+            lines.append(f"Full report: {report_path}")
+        ui.next_step("\n".join(lines))
     return 0
 
 
@@ -2574,6 +2721,323 @@ def cmd_runs(args: argparse.Namespace) -> int:
         ui.info(f"No runs under {store.runs_dir}")
         return 0
     ui.runs_table(runs)
+    return 0
+
+
+def cmd_devices(args: argparse.Namespace) -> int:
+    from hardware import list_devices_rows
+
+    ui.devices_table(list_devices_rows(), explain=not args.no_explain)
+    if not args.no_explain:
+        ui.info(
+            "Use with: odg fit --model <ref> --device <id>\n"
+            "Or describe directly: odg fit --model <ref> --gpu 24GB / --ram 32GB"
+        )
+    return 0
+
+
+def cmd_fit(args: argparse.Namespace) -> int:
+    """Hardware-aware pipeline: derive the byte budget, then run steps 01–15."""
+    import hardware
+
+    print_explain = not args.no_explain
+
+    # 1 · Build the hardware profile from intent flags (or detect).
+    try:
+        if args.device or args.gpu or args.ram:
+            profile = hardware.profile_from_flags(
+                gpu=args.gpu,
+                ram=args.ram,
+                device=args.device,
+                cpu_only=bool(args.cpu_only),
+            )
+        else:
+            profile = hardware.detect_profile()
+            if profile is None:
+                print(
+                    "ERROR: could not detect hardware. Describe it instead:\n"
+                    "  odg fit --model … --gpu 24GB | --ram 32GB | --device rtx-3060-12gb\n"
+                    "  (see: odg devices)",
+                    file=sys.stderr,
+                )
+                return 1
+            ui.warn(
+                f"No hardware flags given — auto-detected: {profile.id} "
+                f"({profile.memory_pool_gb():g} GB {profile.kind}). "
+                "Pass --device/--gpu/--ram to override.",
+                explain=print_explain,
+            )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    ui.step_banner(
+        0,
+        "Hardware-aware fit",
+        model=args.model,
+        run_id=args.run or "(auto)",
+        root=str(getattr(args, "artifacts", None) or Path.cwd() / "artifacts"),
+        goal="Translate hardware into a weight-byte budget, then optimize under it.",
+        bullets=[
+            f"Hardware: {profile.id} ({profile.memory_pool_gb():g} GB {profile.kind})",
+            f"Context: {args.ctx or '(model default, capped at 4096)'} · KV {args.kv_dtype}",
+            "budget = pool × usable − KV cache − runtime overhead",
+        ],
+        explain=print_explain,
+    )
+
+    # 2 · Resolve first — the KV-cache math needs the architecture descriptor.
+    resolve_args = argparse.Namespace(
+        command="run",
+        artifacts=args.artifacts,
+        model=args.model,
+        quant=args.quant,
+        no_ask=True,
+        new_run=bool(args.new_run),
+        run=args.run,
+        force=bool(args.force),
+        prefer_hf=bool(args.prefer_hf),
+        download_weights=bool(args.download_weights),
+        until="resolve",
+        from_step=None,
+        quiet=bool(args.quiet),
+        no_explain=args.no_explain,
+    )
+    code = cmd_run(resolve_args)
+    if code != 0:
+        return code
+
+    store = _store(args)
+    try:
+        meta = _require_run(store, model=args.model, run_id=args.run)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    resolve_out = store.read_step_output(meta.run_id, "resolve") or {}
+    descriptor = resolve_out.get("descriptor") or {}
+
+    # 3 · Derive the budget and show every subtraction.
+    try:
+        plan = hardware.derive_budget(
+            profile, descriptor, ctx=args.ctx, kv_dtype=args.kv_dtype
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    ui.section("hardware → budget", explain=print_explain)
+    ui.kv(plan.display_rows(), explain=print_explain)
+    ui.notes(plan.notes, explain=print_explain)
+
+    fit_plan_path = Path(meta.root) / "fit_plan.json"
+    store.write_json(fit_plan_path, plan.summary_dict())
+    ui.info(f"Fit plan saved: {fit_plan_path}", explain=print_explain)
+
+    # A resumed run keeps its old recipe unless the user forces a re-optimize.
+    if store.is_step_done(meta.run_id, "optimize") and not args.force:
+        opt_in = store.step_path(meta.run_id, "optimize") / "input.json"
+        prev_budget = None
+        if opt_in.is_file():
+            prev_budget = (json.loads(opt_in.read_text()) or {}).get("budget_mb")
+        if prev_budget is None or abs(float(prev_budget) - plan.weight_budget_mb) > 1.0:
+            ui.warn(
+                "This run already has an optimized recipe under a different "
+                "budget — it will be kept. Pass --force (or --new-run) to "
+                f"re-optimize for {plan.weight_budget_mb:.0f} MiB.",
+                explain=print_explain,
+            )
+
+    # 4 · Run the rest of the pipeline under the derived budget.
+    if args.until and args.until.replace("-", "_") == "resolve":
+        return 0
+    pipeline_args = argparse.Namespace(
+        command="run",
+        artifacts=args.artifacts,
+        model=args.model,
+        quant=args.quant,
+        no_ask=True,
+        new_run=False,
+        run=meta.run_id,
+        force=bool(args.force),
+        prefer_hf=bool(args.prefer_hf),
+        download_weights=bool(args.download_weights),
+        until=args.until,
+        from_step="load",
+        quiet=bool(args.quiet),
+        no_explain=args.no_explain,
+        budget_mb=plan.weight_budget_mb,
+    )
+    return cmd_run(pipeline_args)
+
+
+def cmd_benchmark(args: argparse.Namespace) -> int:
+    from datetime import datetime, timezone
+
+    from benchmark import SUITES, run_benchmark
+
+    print_explain = not args.no_explain
+
+    if args.suite not in SUITES:
+        known = ", ".join(sorted(SUITES))
+        print(f"ERROR: unknown suite {args.suite!r}. Suites: {known}", file=sys.stderr)
+        return 1
+
+    # Locate the GGUF: explicit path, or the run's exported candidate.
+    store = _store(args)
+    meta = None
+    gguf_path = Path(args.gguf) if args.gguf else None
+    model_ref = None
+    recipe_path = None
+    if gguf_path is None or args.model or args.run:
+        try:
+            meta = _require_run(store, model=args.model, run_id=args.run)
+            model_ref = meta.model_ref
+        except ValueError as exc:
+            if gguf_path is None:
+                print(
+                    f"ERROR: {exc}\n"
+                    "Pass a GGUF path, or --model/--run for a finished run.",
+                    file=sys.stderr,
+                )
+                return 1
+    if gguf_path is None and meta is not None:
+        export_out = store.read_step_output(meta.run_id, "export") or {}
+        gguf_out = export_out.get("gguf_out")
+        if not gguf_out or not Path(gguf_out).is_file():
+            print(
+                "ERROR: this run has no exported GGUF (export was dry_run?).\n"
+                f"  Produce one: odg export --model {meta.model_ref} --mode llama --force\n"
+                "  Or pass a .gguf path directly: odg benchmark path/to/model.gguf",
+                file=sys.stderr,
+            )
+            return 1
+        gguf_path = Path(gguf_out)
+        rp = Path(export_out.get("recipe_path") or "")
+        recipe_path = rp if rp.is_file() else None
+    if gguf_path is None or not gguf_path.is_file():
+        print(f"ERROR: GGUF not found: {gguf_path}", file=sys.stderr)
+        return 1
+
+    device_profile = None
+    if args.device:
+        from hardware import get_device
+
+        try:
+            device_profile = get_device(args.device).to_dict()
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    if args.out:
+        out_dir = Path(args.out)
+    elif meta is not None:
+        out_dir = Path(meta.root) / "benchmarks" / f"{stamp}-{args.suite}"
+    else:
+        out_dir = gguf_path.parent / "odg-benchmarks" / f"{stamp}-{args.suite}"
+
+    ui.step_banner(
+        0,
+        "Benchmark",
+        model=model_ref or gguf_path.name,
+        run_id=meta.run_id if meta else "(standalone)",
+        root=str(out_dir),
+        goal="Measure throughput (llama-bench) and quality (lm-eval, if installed).",
+        bullets=[
+            f"Suite: {args.suite} — {SUITES[args.suite].description}",
+            f"GGUF: {gguf_path}",
+            "Quality deltas are paired vs BF16 with CIs — never raw thresholds",
+        ],
+        explain=print_explain,
+    )
+
+    try:
+        with ui.working("Benchmarking…", explain=print_explain):
+            result = run_benchmark(
+                gguf_path,
+                suite_id=args.suite,
+                model_ref=model_ref,
+                device_profile=device_profile,
+                recipe_path=recipe_path,
+                llama_bench=args.llama_bench,
+                out_dir=out_dir,
+            )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    payload = result.summary_dict()
+    if print_explain:
+        tp = result.throughput or {}
+        rows = [
+            ("gguf", Path(result.gguf_path).name),
+            ("sha256", result.gguf_sha256[:16] + "…"),
+            ("size", f"{result.memory['weights_gb']} GB"),
+            (
+                "throughput",
+                f"pp {tp.get('pp_tps', '—')} t/s · tg {tp.get('tg_tps', '—')} t/s"
+                if tp
+                else "not measured (llama-bench unavailable)",
+            ),
+            (
+                "quality",
+                "skipped: " + str(result.quality.get("reason"))
+                if result.quality.get("skipped")
+                else f"{len(result.quality.get('tasks') or {})} tasks",
+            ),
+            ("result", result.result_path),
+        ]
+        ui.section("benchmark result")
+        ui.kv(rows)
+        ui.notes(result.notes)
+        if meta is not None:
+            ui.next_step(
+                f"Included in the report on next render: odg report --model {model_ref}"
+            )
+    else:
+        print(json.dumps(payload, indent=2))
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    from report import generate_report
+
+    print_explain = not args.no_explain
+    store = _store(args)
+    try:
+        meta = _require_run(store, model=args.model, run_id=args.run)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        with ui.working("Rendering report.html…", explain=print_explain):
+            result = generate_report(Path(meta.root), out_path=args.out)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if print_explain:
+        ui.section("report")
+        ui.kv(
+            [
+                ("run", meta.run_id),
+                ("sections", f"{result.sections_rendered} rendered"),
+                (
+                    "missing",
+                    ", ".join(result.sections_missing) or "none",
+                ),
+                ("path", result.report_path),
+            ]
+        )
+        ui.next_step(f"Open it: open {result.report_path}")
+    else:
+        print(json.dumps(result.summary_dict(), indent=2))
+
+    if args.open_browser:
+        import webbrowser
+
+        webbrowser.open(Path(result.report_path).resolve().as_uri())
     return 0
 
 

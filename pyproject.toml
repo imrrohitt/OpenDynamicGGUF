@@ -57,4 +57,7 @@ py-modules = [
   "export",
   "validate",
   "quant_formats",
+  "hardware",
+  "benchmark",
+  "report",
 ]

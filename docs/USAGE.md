@@ -20,6 +20,7 @@ End-to-end guide: install → run the pipeline → read the recipe → **write a
 9. [Useful flags](#9-useful-flags)
 10. [Inspecting runs](#10-inspecting-runs)
 11. [Troubleshooting](#11-troubleshooting)
+12. [Platform commands: fit, benchmark, report](#12-platform-commands-fit-benchmark-report)
 
 ---
 
@@ -412,9 +413,60 @@ odg validate --model functiongemma:latest --force
 
 ---
 
+## 12. Platform commands: fit, benchmark, report
+
+Phase 1 of the [platform expansion](./platform/README.md) adds intent-level commands on top of the pipeline.
+
+### `odg fit` — describe your hardware, not a byte budget
+
+```bash
+odg fit --model functiongemma:latest --gpu 12GB
+odg fit --model qwen3 --device macbook-air-16gb --ctx 8192
+odg fit --model llama4 --ram 32GB --cpu-only
+odg devices                       # list named device profiles
+```
+
+`fit` resolves the model, derives the weight budget —
+
+```text
+budget = memory pool × usable fraction − KV cache(model, ctx) − runtime overhead
+```
+
+— prints every subtraction (auditable), saves it as `fit_plan.json` in the run, and then runs the normal pipeline with that budget. The KV cache is exact math from the architecture descriptor (layers × ctx × KV width × dtype).
+
+> Resuming a run that already has an optimized recipe keeps the old recipe; pass `--force` (or `--new-run`) to re-optimize under the new hardware budget.
+
+### `odg benchmark` — comparable numbers for any GGUF
+
+```bash
+odg benchmark model-UD.gguf --suite smoke          # minutes
+odg benchmark --model functiongemma:latest         # uses the run's exported GGUF
+odg benchmark model.gguf --suite standard --device rtx-3060-12gb
+```
+
+Writes `benchresult.json` (`odg/benchresult/v1`) with:
+
+- **throughput** via `llama-bench` (needs `LLAMA_CPP_DIR`; skipped honestly otherwise),
+- **quality** via lm-eval-harness (`pip install lm-eval` to enable; skipped honestly otherwise) — deltas are paired per-question vs the BF16 reference with bootstrap CIs, never raw thresholds,
+- file size + sha256, and the device profile tag.
+
+Results stored under `<run>/benchmarks/` are picked up by the report automatically.
+
+### `odg report` — one self-contained report.html
+
+```bash
+odg report --model functiongemma:latest
+odg report --model functiongemma:latest --open
+```
+
+Renders `report.html` in the run root from artifacts the steps already wrote: bit-allocation table with per-group reasons, byte distribution, sensitivity heatmap, size↔quality Pareto frontier, Tier-1 gates, benchmarks, and a reproducibility block. Sections for steps that haven't run render as "not run". `odg run` / `odg fit` auto-render it after validate.
+
+---
+
 ## Related docs
 
 - Project overview: [`../README.md`](../README.md)
 - Per-step design docs: [`./steps/README.md`](./steps/README.md)
+- Platform feature breakdowns: [`./platform/README.md`](./platform/README.md)
 - Export step: [`./steps/14-export-gguf.md`](./steps/14-export-gguf.md)
 - Validate step: [`./steps/15-validate-and-release.md`](./steps/15-validate-and-release.md)

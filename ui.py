@@ -543,6 +543,32 @@ def formats_table(rows: Sequence[dict[str, str]], *, explain: bool = True) -> No
     console.print(table)
 
 
+def devices_table(rows: Sequence[dict[str, str]], *, explain: bool = True) -> None:
+    if not enabled(explain):
+        print(f"{'ID':<22} {'KIND':<15} {'POOL':<10} {'BANDWIDTH':<12} USABLE")
+        for r in rows:
+            print(
+                f"{r['id']:<22} {r['kind']:<15} {r['pool']:<10} "
+                f"{r['bandwidth']:<12} {r['usable']}"
+            )
+        return
+    assert console is not None
+    table = Table(
+        title="Named hardware profiles (odg fit --device <id>)",
+        box=box.ROUNDED,
+        header_style="bold cyan",
+        border_style="cyan",
+    )
+    table.add_column("ID", style="bold white", no_wrap=True)
+    table.add_column("Kind", style="odg.key")
+    table.add_column("Memory pool", style="bold green", no_wrap=True)
+    table.add_column("Bandwidth", style="odg.val", no_wrap=True)
+    table.add_column("Usable", style="odg.muted", no_wrap=True)
+    for r in rows:
+        table.add_row(r["id"], r["kind"], r["pool"], r["bandwidth"], r["usable"])
+    console.print(table)
+
+
 def prompt_quant_format(
     *,
     default_id: str = "q4_k_m",
